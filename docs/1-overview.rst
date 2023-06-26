@@ -1,7 +1,8 @@
 
-===================
-Project Description
-===================
+
+========
+Overview
+========
 
 `Fitbit Onboarding` provides a web application that allows users to self register and
 manage consent for providing wearable data. Initially this includes a single data
@@ -9,8 +10,8 @@ provider -- Fitbit -- but in time will be expanded to include other wearables or
 data is regularly ingested and stored in BigQuery where it can be analyzed with a variety
 of analytic tools.
 
-Project Background
-==================
+Why?
+====
 
 With wearables growing usage and their increasing medical capabilities, many
 medical providers and clinics want to be able to easily request access to, and

@@ -1,3 +1,5 @@
+#!/bin/sh
+
 # Copyright 2022 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,4 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""device connect for fitbit: onboarding and consent management app"""
+DATASET=${1:-fitbit} 
+GCSBUCKET=${2:-starterkit-export}
+
+for x in `bq  --format json ls fitbit | jq '.[] | .id' | cut -d\" -f 2 | cut -d. -f 2`; 
+  do echo "*** exporting ${DATASET}.$x ***";
+  bq extract --compression GZIP ${DATASET}.$x gs://${GCSBUCKET}/${DATASET}.$x.gz; 
+done
+

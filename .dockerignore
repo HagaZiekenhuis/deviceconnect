@@ -2,8 +2,6 @@
 **/.classpath
 **/.dockerignore
 **/.env
-**/.env-*
-**/.env.*
 **/.git
 **/.gitignore
 **/.project
@@ -15,6 +13,7 @@
 **/*.dbmdl
 **/*.jfm
 **/bin
+**/functions
 **/charts
 **/docker-compose*
 **/compose*
@@ -26,3 +25,5 @@
 **/values.dev.yaml
 **/*-service-account.json
 README.md
+**/letsencrypt
+**/data

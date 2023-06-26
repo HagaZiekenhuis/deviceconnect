@@ -23,7 +23,10 @@ Routes:
 
     /ingest: test route to test if the blueprint is correctly registered
 
-    /fitbit_chunk_1: Badges, Social, Device information
+    /update_tokens: will refresh all fitbit tokens to ensure they are valid
+        when being used.
+
+    /fitbit_chunk_1: Device information
 
     /fitbit_body_weight: body and weight data
 
@@ -34,10 +37,6 @@ Routes:
     /fitbit_intraday_scope: includes intraday heartrate and steps
 
     /fitbit_sleep_scope:  sleep data
-
-    /fitbit_activity_scope: activity data
-
-    /fitbit_spo2_scope: spo2 data
 
 Dependencies:
 
@@ -58,125 +57,165 @@ Notes:
 
     all the data is ingested into BigQuery tables.
 
+    there is currently no protection for these routes.
 
 """
 
 import os
 import timeit
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta, date
+from google.api_core.exceptions import NotFound
 import logging
 
 import pandas as pd
 import pandas_gbq
+from pandas_gbq.exceptions import GenericGBQException
 from flask import Blueprint, request
 from flask_dance.contrib.fitbit import fitbit
-from authlib.integrations.flask_client import OAuth
 from skimpy import clean_columns
 
 from .fitbit_auth import fitbit_bp
+from .security import token_required
 
 
 log = logging.getLogger(__name__)
+last_resp = 0
 
 
 bp = Blueprint("fitbit_ingest_bp", __name__)
 
-bigquery_datasetname = os.environ.get("BIGQUERY_DATASET")
-if not bigquery_datasetname:
-    bigquery_datasetname = "fitbit2"
+bigquery_datasetname = os.environ.get("BIGQUERY_DATASET", "fitbit")
 
 
 def _tablename(table: str) -> str:
     return bigquery_datasetname + "." + table
 
 
-@bp.route("/ingest")
+@bp.route("/ingest", methods=["GET", "POST"])
+@token_required
 def ingest():
-    """test route to ensure that blueprint is loaded"""
-
-    result = []
-    allusers = fitbit_bp.storage.all_users()
-    log.debug(allusers)
-
-    for x in allusers:
-
+    """Get all data from endpoints"""
+    fitbit_bp.storage.user = None
+    log.info('Received request')
+    try:
+        last_exit_code = fitbit_chunk_1()
+    except (Exception):
+        fitbit_bp.storage.user = None
+    """
+    if last_exit_code != 429:
+        last_exit_code = fitbit_body_weight()
+    else:
+        return '', 429
+    if last_exit_code != 429:
+        last_exit_code = fitbit_nutrition_scope()
+    else:
+        return '', 429
+    """
+    if last_exit_code != 429:
         try:
+            last_exit_code = fitbit_heart_rate_scope()
+        except (Exception):
+            fitbit_bp.storage.user = None
+    else:
+        fitbit_bp.storage.user = None
+        return '', 429
+    if last_exit_code != 429:
+        try:
+            last_exit_code = fitbit_activity_scope()
+        except (Exception):
+            fitbit_bp.storage.user = None
+    else:
+        fitbit_bp.storage.user = None
+        return '', 429
+    if last_exit_code != 429:
+        try:
+            last_exit_code = fitbit_intraday_scope()
+        except (Exception):
+            fitbit_bp.storage.user = None
+    else:
+        fitbit_bp.storage.user = None
+        return '', 429
+    if last_exit_code != 429:
+        try:
+            last_exit_code = fitbit_sleep_scope()
+        except (Exception):
+            fitbit_bp.storage.user = None
+    else:
+        fitbit_bp.storage.user = None
+        return '', 429
+    fitbit_bp.storage.user = None
+    return '', 200
 
-            log.debug("user = " + x)
 
-            fitbit_bp.storage.user = x
-            if fitbit_bp.session.token:
-                del fitbit_bp.session.token
-
-            token = fitbit_bp.token
-
-            log.debug("access token: " + token["access_token"])
-            log.debug("refresh_token: " + token["refresh_token"])
-            log.debug("expiration time " + str(token["expires_at"]))
-            log.debug("             in " + str(token["expires_in"]))
-
-            resp = fitbit.get("/1/user/-/profile.json")
-
-            log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
-
-            j = resp.json()
-
-            log.debug(f"retrieved profile: {resp.reason}")
-            log.debug(
-                f"{x}: {j['user']['fullName']} ({j['user']['gender']}/{j['user']['age']})"
-            )
-            result.append(
-                f"{x}: {j['user']['fullName']} ({j['user']['gender']}/{j['user']['age']})"
-            )
-
-        except (Exception) as e:
-            log.error("exception occured: %s", str(e))
-
-    return str(result)
-
-
-def _normalize_response(df, column_list, email, date_pulled):
+def _normalize_response(df, column_list, fitbit_id, pulled_date=None, date_column=None, status_code=None):
     for col in column_list:
         if col not in df.columns:
             df[col] = None
     df = df.reindex(columns=column_list)
-    df.insert(0, "id", email)
-    df.insert(1, "date", date_pulled)
+    if df.empty and pulled_date is not None and status_code == 200:
+        # Write row with only date to make sure the application knows it has already been synced
+        df = df.append({date_column: pulled_date}, ignore_index=True)
+    df.insert(0, "id", fitbit_id)
+    df.insert(1, "pull_date", datetime.now().strftime("%Y-%m-%d"))
     df = clean_columns(df)
     return df
 
 
-def _date_pulled():
-    """set the date pulled"""
-
-    date_pulled = date.today() - timedelta(days=1)
-    return date_pulled.strftime("%Y-%m-%d")
+def _last_date_in_bq(tablename: str, user_id: str,
+                     datetime_column: str, date_type: bool = False):
+    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
+    if date_type:
+        sql = "SELECT `%s` AS `last_sync` " \
+            "FROM `%s` " \
+            "WHERE `id` = '%s' " \
+            "ORDER BY `last_sync` DESC " \
+            "LIMIT 1" % (datetime_column, tablename, user_id)
+    else:
+        sql = "SELECT EXTRACT(DATE FROM `%s`) AS `last_sync` " \
+            "FROM `%s` " \
+            "WHERE `id` = '%s' " \
+            "ORDER BY `last_sync` DESC " \
+            "LIMIT 1" % (datetime_column, tablename, user_id)
+    try:
+        df = pandas_gbq.read_gbq(sql, project_id=project_id, progress_bar_type=None)
+        try:
+            last_sync = df['last_sync'].tolist()[0] + timedelta(days=1)
+        except IndexError:
+            # No earlier data found, possibly the first sync
+            last_sync = datetime.strptime(os.environ.get('FIRST_SYNC'), "%Y-%m-%d")
+    except (NotFound, GenericGBQException) as error:
+        # Table might not yet exist
+        logging.debug(error)
+        last_sync = datetime.strptime(os.environ.get('FIRST_SYNC'), "%Y-%m-%d")
+    if isinstance(last_sync, date):
+        last_sync = datetime.combine(last_sync, datetime.min.time())
+    return last_sync
 
 
 #
-# Chunk 1: Badges, Social, Device
+# Chunk 1: Device
 #
 @bp.route("/fitbit_chunk_1")
+@token_required
 def fitbit_chunk_1():
 
     start = timeit.default_timer()
+    global last_resp
     project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
-    # if caller provided date as query params, use that otherwise use yesterday
-    date_pulled = request.args.get("date", _date_pulled())
     user_list = fitbit_bp.storage.all_users()
-    if request.args.get("user") in user_list:
-        user_list = [request.args.get("user")]
+    try:
+        if request.headers["user"] in user_list:
+            user_list = [request.headers["user"]]
+    except (Exception):
+        pass
 
     log.debug("fitbit_chunk_1:")
 
     pd.set_option("display.max_columns", 500)
 
-    badges_list = []
     device_list = []
-    social_list = []
 
     for user in user_list:
-
         log.debug("user: %s", user)
 
         fitbit_bp.storage.user = user
@@ -185,58 +224,9 @@ def fitbit_chunk_1():
             del fitbit_bp.session.token
 
         try:
-
-            ############## CONNECT TO BADGES ENDPOINT #################
-
-            resp = fitbit.get("/1/user/-/badges.json")
-
-            log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
-
-            badges = resp.json()["badges"]
-
-            badges_df = pd.json_normalize(badges)
-            badges_columns = [
-                "badgeGradientEndColor",
-                "badgeGradientStartColor",
-                "badgeType",
-                "category",
-                "cheers",
-                "dateTime",
-                "description",
-                "earnedMessage",
-                "encodedId",
-                "image100px",
-                "image125px",
-                "image300px",
-                "image50px",
-                "image75px",
-                "marketingDescription",
-                "mobileDescription",
-                "name",
-                "shareImage640px",
-                "shareText",
-                "shortDescription",
-                "shortName",
-                "timesAchieved",
-                "value",
-                "unit",
-            ]
-            badges_df = _normalize_response(
-                badges_df, badges_columns, user, date_pulled
-            )
-            try:
-                badges_df = badges_df.drop(["cheers"], axis=1)
-            except:
-                pass
-
-            badges_list.append(badges_df)
-
-        except (Exception) as e:
-            log.error("exception occured: %s", str(e))
-
-        try:
-            ############## CONNECT TO DEVICE ENDPOINT #################
-            resp = fitbit.get("1/user/-/devices.json")
+            # CONNECT TO DEVICE ENDPOINT #
+            resp = fitbit.get("/1/user/-/devices.json")
+            last_resp = resp.status_code
 
             log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
 
@@ -245,7 +235,7 @@ def fitbit_chunk_1():
                 device_df = device_df.drop(
                     ["features", "id", "mac", "type"], axis=1
                 )
-            except:
+            except (Exception):
                 pass
 
             device_columns = [
@@ -255,7 +245,7 @@ def fitbit_chunk_1():
                 "lastSyncTime",
             ]
             device_df = _normalize_response(
-                device_df, device_columns, user, date_pulled
+                device_df, device_columns, fitbit_bp.token['user_id']
             )
             device_df["last_sync_time"] = device_df["last_sync_time"].apply(
                 lambda x: datetime.strptime(x, "%Y-%m-%dT%H:%M:%S.%f")
@@ -263,118 +253,19 @@ def fitbit_chunk_1():
             device_list.append(device_df)
 
         except (Exception) as e:
-            log.error("exception occured: %s", str(e))
-
-        try:
-            ############## CONNECT TO SOCIAL ENDPOINT #################
-            resp = fitbit.get("1.1/user/-/friends.json")
-
-            log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
-
-            social_df = pd.json_normalize(resp.json()["data"])
-            social_df = social_df.rename(columns={"id": "friend_id"})
-            social_columns = [
-                "friend_id",
-                "type",
-                "attributes.name",
-                "attributes.friend",
-                "attributes.avatar",
-                "attributes.child",
-            ]
-            social_df = _normalize_response(
-                social_df, social_columns, user, date_pulled
-            )
-            social_list.append(social_df)
-
-        except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+            log.exception("exception occured: %s", str(e))
 
     # end loop over users
 
-    #### CONCAT DATAFRAMES INTO BULK DF ####
+    # CONCAT DATAFRAMES INTO BULK DF #
 
     load_stop = timeit.default_timer()
     time_to_load = load_stop - start
-    print("Program Executed in " + str(time_to_load))
+    log.info("Program Executed in " + str(time_to_load))
 
-    # ######## LOAD DATA INTO BIGQUERY #########
+    # LOAD DATA INTO BIGQUERY #
 
     log.debug("push to BQ")
-
-    # sql = """
-    # SELECT country_name, alpha_2_code
-    # FROM `bigquery-public-data.utility_us.country_code_iso`
-    # WHERE alpha_2_code LIKE 'A%'
-    # """
-    # df = pandas_gbq.read_gbq(sql, project_id=project_id)
-
-    if len(badges_list) > 0:
-
-        try:
-
-            bulk_badges_df = pd.concat(badges_list, axis=0)
-
-            pandas_gbq.to_gbq(
-                dataframe=bulk_badges_df,
-                destination_table=_tablename("badges"),
-                project_id=project_id,
-                if_exists="append",
-                table_schema=[
-                    {
-                        "name": "id",
-                        "type": "STRING",
-                        "mode": "REQUIRED",
-                        "description": "Primary Key",
-                    },
-                    {
-                        "name": "date",
-                        "type": "DATE",
-                        "mode": "REQUIRED",
-                        "description": "The date values were extracted",
-                    },
-                    {"name": "badge_gradient_end_color", "type": "STRING"},
-                    {"name": "badge_gradient_start_color", "type": "STRING"},
-                    {
-                        "name": "badge_type",
-                        "type": "STRING",
-                        "description": "Type of badge received.",
-                    },
-                    {"name": "category", "type": "STRING"},
-                    {
-                        "name": "date_time",
-                        "type": "STRING",
-                        "description": "Date the badge was achieved.",
-                    },
-                    {"name": "description", "type": "STRING"},
-                    {"name": "image_100px", "type": "STRING"},
-                    {"name": "image_125px", "type": "STRING"},
-                    {"name": "image_300px", "type": "STRING"},
-                    {"name": "image_50px", "type": "STRING"},
-                    {"name": "image_75px", "type": "STRING"},
-                    {"name": "name", "type": "STRING"},
-                    {"name": "share_image_640px", "type": "STRING"},
-                    {"name": "share_text", "type": "STRING"},
-                    {"name": "short_name", "type": "STRING"},
-                    {
-                        "name": "times_achieved",
-                        "type": "INTEGER",
-                        "description": "Number of times the user has achieved the badge.",
-                    },
-                    {
-                        "name": "value",
-                        "type": "INTEGER",
-                        "description": "Units of meaure based on localization settings.",
-                    },
-                    {
-                        "name": "unit",
-                        "type": "STRING",
-                        "description": "The badge goal in the unit measurement.",
-                    },
-                ],
-            )
-
-        except (Exception) as e:
-            log.error("exception occured: %s", str(e))
 
     if len(device_list) > 0:
 
@@ -387,6 +278,7 @@ def fitbit_chunk_1():
                 destination_table=_tablename("device"),
                 project_id=project_id,
                 if_exists="append",
+                progress_bar=False,
                 table_schema=[
                     {
                         "name": "id",
@@ -394,14 +286,15 @@ def fitbit_chunk_1():
                         "description": "Primary Key",
                     },
                     {
-                        "name": "date",
+                        "name": "pull_date",
                         "type": "DATE",
                         "description": "The date values were extracted",
                     },
                     {
                         "name": "battery",
                         "type": "STRING",
-                        "description": "Returns the battery level of the device. Supported: High | Medium | Low | Empty",
+                        "description": "Returns the battery level of the device. Supported: High | Medium | Low | \
+                            Empty",
                     },
                     {
                         "name": "battery_level",
@@ -416,94 +309,40 @@ def fitbit_chunk_1():
                     {
                         "name": "last_sync_time",
                         "type": "TIMESTAMP",
-                        "description": "Timestamp representing the last time the device was sync'd with the Fitbit mobile application.",
+                        "description": "Timestamp representing the last time the device was sync'd with the Fitbit \
+                            mobile application.",
                     },
                 ],
             )
 
         except (Exception) as e:
-            log.error("exception occured: %s", str(e))
-
-    if len(social_list) > 0:
-
-        try:
-
-            bulk_social_df = pd.concat(social_list, axis=0)
-
-            pandas_gbq.to_gbq(
-                dataframe=bulk_social_df,
-                destination_table=_tablename("social"),
-                project_id=project_id,
-                if_exists="append",
-                table_schema=[
-                    {
-                        "name": "id",
-                        "type": "STRING",
-                        "description": "Primary Key",
-                    },
-                    {
-                        "name": "date",
-                        "type": "DATE",
-                        "description": "The date values were extracted",
-                    },
-                    {
-                        "name": "friend_id",
-                        "type": "STRING",
-                        "description": "Fitbit user id",
-                    },
-                    {
-                        "name": "type",
-                        "type": "STRING",
-                        "description": "Fitbit user id",
-                    },
-                    {
-                        "name": "attributes_name",
-                        "type": "STRING",
-                        "description": "Person's display name.",
-                    },
-                    {
-                        "name": "attributes_friend",
-                        "type": "BOOLEAN",
-                        "description": "The product name of the device.",
-                    },
-                    {
-                        "name": "attributes_avatar",
-                        "type": "STRING",
-                        "description": "Link to user's avatar picture.",
-                    },
-                    {
-                        "name": "attributes_child",
-                        "type": "BOOLEAN",
-                        "description": "Boolean value describing friend as a child account.",
-                    },
-                ],
-            )
-
-        except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+            log.exception("exception occured: %s", str(e))
 
     stop = timeit.default_timer()
     execution_time = stop - start
-    print("Fitbit Chunk Loaded " + str(execution_time))
+    log.info("Fitbit Chunk Loaded " + str(execution_time))
 
     fitbit_bp.storage.user = None
 
-    return "Fitbit Chunk Loaded"
+    return last_resp
 
 
 #
 # Body and Weight
 #
 @bp.route("/fitbit_body_weight")
+@token_required
 def fitbit_body_weight():
 
     start = timeit.default_timer()
+    global last_resp
     project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
-    # if caller provided date as query params, use that otherwise use yesterday
-    date_pulled = request.args.get("date", _date_pulled())
     user_list = fitbit_bp.storage.all_users()
-    if request.args.get("user") in user_list:
-        user_list = [request.args.get("user")]
+    try:
+        if request.headers["user"] in user_list:
+            user_list = [request.headers["user"]]
+    except (Exception):
+        pass
 
     pd.set_option("display.max_columns", 500)
 
@@ -518,35 +357,47 @@ def fitbit_body_weight():
         if fitbit_bp.session.token:
             del fitbit_bp.session.token
 
-        try:
+        # loop over last synced date in bigquery to now or date specified by user
+        last_sync = request.args.get("date", _last_date_in_bq(_tablename("body_weight"),
+                                     fitbit_bp.token['user_id'], "date", True))
+        date_list = [last_sync + timedelta(days=x) for x in range((datetime.now()-last_sync).days)]
 
-            resp = fitbit.get(
-                "/1/user/-/body/log/weight/date/" + date_pulled + ".json"
-            )
-
-            log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
-
-            body_weight = resp.json()["weight"]
-            assert body_weight, "weight returned no data"
-            body_weight_df = pd.json_normalize(body_weight)
+        for pull_date in date_list:
             try:
-                body_weight_df = body_weight_df.drop(["date", "time"], axis=1)
-            except:
-                pass
 
-            body_weight_columns = ["bmi", "fat", "logId", "source", "weight"]
-            body_weight_df = _normalize_response(
-                body_weight_df, body_weight_columns, user, date_pulled
-            )
-            body_weight_df_list.append(body_weight_df)
+                resp = fitbit.get(
+                    "/1/user/-/body/log/weight/date/" + pull_date.strftime("%Y-%m-%d") + ".json"
+                )
+                last_resp = resp.status_code
 
-        except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+                log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
+
+                try:
+                    body_weight = resp.json()["weight"]
+                    body_weight_df = pd.json_normalize(body_weight)
+                except KeyError:
+                    assert body_weight, "weight returned no data"
+                    if resp.status_code == 200:
+                        body_weight_df = pd.json_normalize({})
+
+                body_weight_columns = ["bmi", "date", "fat", "logId", "source", "time", "weight"]
+                body_weight_df = _normalize_response(
+                    body_weight_df, body_weight_columns, fitbit_bp.token['user_id'],
+                    pull_date.strftime("%Y-%m-%d"), 'date', resp.status_code
+                )
+                body_weight_df['date'] = pd.to_datetime(body_weight_df['date'], format='%Y-%m-%d')
+                body_weight_df['time'] = pd.to_datetime(body_weight_df['time'], format='%H:%M:%S')
+                body_weight_df_list.append(body_weight_df)
+
+            except (Exception) as e:
+                log.exception("exception occured: %s", str(e))
+
+            if resp.status_code == 429:
+                break
 
     # end loop over users
 
     log.debug("push to BQ")
-
     if len(body_weight_df_list) > 0:
 
         try:
@@ -558,6 +409,7 @@ def fitbit_body_weight():
                 destination_table=_tablename("body_weight"),
                 project_id=project_id,
                 if_exists="append",
+                progress_bar=False,
                 table_schema=[
                     {
                         "name": "id",
@@ -566,7 +418,7 @@ def fitbit_body_weight():
                         "description": "Primary Key",
                     },
                     {
-                        "name": "date",
+                        "name": "pull_date",
                         "type": "DATE",
                         "mode": "REQUIRED",
                         "description": "The date values were extracted",
@@ -575,6 +427,11 @@ def fitbit_body_weight():
                         "name": "bmi",
                         "type": "FLOAT",
                         "description": "Calculated BMI in the format X.XX",
+                    },
+                    {
+                        "name": "date",
+                        "type": "DATE",
+                        "description": "Log entry date in the format yyyy-MM-dd.",
                     },
                     {
                         "name": "fat",
@@ -592,6 +449,11 @@ def fitbit_body_weight():
                         "description": "The source of the weight log.",
                     },
                     {
+                        "name": "time",
+                        "type": "TIME",
+                        "description": "Time of the measurement; hours and minutes in the format HH:mm:ss."
+                    },
+                    {
                         "name": "weight",
                         "type": "FLOAT",
                         "description": "Weight in the format X.XX,",
@@ -600,30 +462,32 @@ def fitbit_body_weight():
             )
 
         except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+            log.exception("exception occured: %s", str(e))
 
     stop = timeit.default_timer()
     execution_time = stop - start
-    print("Body & Weight Scope Loaded " + str(execution_time))
+    log.info("Body & Weight Scope Loaded " + str(execution_time))
 
     fitbit_bp.storage.user = None
-
-    return "Body & Weight Scope Loaded"
+    return last_resp
 
 
 #
 # Nutrition Data
 #
 @bp.route("/fitbit_nutrition_scope")
+@token_required
 def fitbit_nutrition_scope():
 
     start = timeit.default_timer()
+    global last_resp
     project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
-    # if caller provided date as query params, use that otherwise use yesterday
-    date_pulled = request.args.get("date", _date_pulled())
     user_list = fitbit_bp.storage.all_users()
-    if request.args.get("user") in user_list:
-        user_list = [request.args.get("user")]
+    try:
+        if request.headers["user"] in user_list:
+            user_list = [request.headers["user"]]
+    except (Exception):
+        pass
 
     pd.set_option("display.max_columns", 500)
 
@@ -640,94 +504,117 @@ def fitbit_nutrition_scope():
         if fitbit_bp.session.token:
             del fitbit_bp.session.token
 
-        try:
+        # loop over last synced date in bigquery to now or date specified by user
+        last_sync = request.args.get("date", _last_date_in_bq(_tablename("nutrition_summary"),
+                                     fitbit_bp.token['user_id'], "date", True))
+        date_list = [last_sync + timedelta(days=x) for x in range((datetime.now()-last_sync).days)]
 
-            resp = fitbit.get(
-                "/1/user/-/foods/log/date/" + date_pulled + ".json"
-            )
-
-            log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
-
-            nutrition_summary = resp.json()["summary"]
-            nutrition_logs = resp.json()["foods"]
-
-            nutrition_summary_df = pd.json_normalize(nutrition_summary)
-            nutrition_logs_df = pd.json_normalize(nutrition_logs)
-
+        for pull_date in date_list:
             try:
-                nutrition_logs_df = nutrition_logs_df.drop(
-                    [
-                        "loggedFood.creatorEncodedId",
-                        "loggedFood.unit.id",
-                        "loggedFood.units",
-                    ],
-                    axis=1,
+
+                resp = fitbit.get(
+                    "/1/user/-/foods/log/date/" + pull_date.strftime("%Y-%m-%d") + ".json"
                 )
-            except:
-                pass
+                last_resp = resp.status_code
 
-            nutrition_summary_columns = [
-                "calories",
-                "carbs",
-                "fat",
-                "fiber",
-                "protein",
-                "sodium",
-                "water",
-            ]
-            nutrition_logs_columns = [
-                "isFavorite",
-                "logDate",
-                "logId",
-                "loggedFood.accessLevel",
-                "loggedFood.amount",
-                "loggedFood.brand",
-                "loggedFood.calories",
-                "loggedFood.foodId",
-                "loggedFood.mealTypeId",
-                "loggedFood.name",
-                "loggedFood.unit.name",
-                "loggedFood.unit.plural",
-                "nutritionalValues.calories",
-                "nutritionalValues.carbs",
-                "nutritionalValues.fat",
-                "nutritionalValues.fiber",
-                "nutritionalValues.protein",
-                "nutritionalValues.sodium",
-                "loggedFood.locale",
-            ]
+                log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
 
-            nutrition_summary_df = _normalize_response(
-                nutrition_summary_df,
-                nutrition_summary_columns,
-                user,
-                date_pulled,
-            )
-            nutrition_logs_df = _normalize_response(
-                nutrition_logs_df, nutrition_logs_columns, user, date_pulled
-            )
+                nutrition_summary = resp.json()["summary"]
+                nutrition_summary['date'] = pull_date.strftime("%Y-%m-%d")
+                nutrition_logs = resp.json()["foods"]
 
-            nutrition_summary_list.append(nutrition_summary_df)
-            nutrition_logs_list.append(nutrition_logs_df)
+                nutrition_summary_df = pd.json_normalize(nutrition_summary)
+                nutrition_logs_df = pd.json_normalize(nutrition_logs)
 
-        except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+                try:
+                    nutrition_logs_df = nutrition_logs_df.drop(
+                        [
+                            "loggedFood.creatorEncodedId",
+                            "loggedFood.unit.id",
+                            "loggedFood.units",
+                        ],
+                        axis=1,
+                    )
+                except (Exception):
+                    pass
+
+                nutrition_summary_columns = [
+                    "date",
+                    "calories",
+                    "carbs",
+                    "fat",
+                    "fiber",
+                    "protein",
+                    "sodium",
+                    "water",
+                ]
+                nutrition_logs_columns = [
+                    "isFavorite",
+                    "logDate",
+                    "logId",
+                    "loggedFood.accessLevel",
+                    "loggedFood.amount",
+                    "loggedFood.brand",
+                    "loggedFood.calories",
+                    "loggedFood.foodId",
+                    "loggedFood.mealTypeId",
+                    "loggedFood.name",
+                    "loggedFood.unit.name",
+                    "loggedFood.unit.plural",
+                    "nutritionalValues.calories",
+                    "nutritionalValues.carbs",
+                    "nutritionalValues.fat",
+                    "nutritionalValues.fiber",
+                    "nutritionalValues.protein",
+                    "nutritionalValues.sodium",
+                    "loggedFood.locale",
+                ]
+
+                nutrition_summary_df = _normalize_response(
+                    nutrition_summary_df,
+                    nutrition_summary_columns,
+                    fitbit_bp.token['user_id'],
+                    pull_date.strftime("%Y-%m-%d"),
+                    "date",
+                    resp.status_code
+                )
+                nutrition_logs_df = _normalize_response(
+                    nutrition_logs_df, nutrition_logs_columns, fitbit_bp.token['user_id'],
+                    pull_date.strftime("%Y-%m-%d"), "logDate", resp.status_code
+                )
+
+                nutrition_summary_list.append(nutrition_summary_df)
+                nutrition_logs_list.append(nutrition_logs_df)
+
+            except (Exception) as e:
+                log.exception("exception occured: %s", str(e))
+
+            if resp.status_code == 429:
+                break
 
         try:
             resp = fitbit.get("/1/user/-/foods/log/goal.json")
+            last_resp = resp.status_code
 
             log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
 
-            nutrition_goal = resp.json()["goals"]
+            try:
+                nutrition_goal = resp.json()["goals"]
+            except KeyError as e:
+                if resp.status_code == 200:
+                    nutrition_goal = {}
+                else:
+                    raise e
+
             nutrition_goal_df = pd.json_normalize(nutrition_goal)
             nutrition_goal_columns = ["calories"]
             nutrition_goal_df = _normalize_response(
-                nutrition_goal_df, nutrition_goal_columns, user, date_pulled
+                nutrition_goal_df, nutrition_goal_columns, fitbit_bp.token['user_id']
             )
             nutrition_goals_list.append(nutrition_goal_df)
 
         except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+            log.exception("exception occured: %s", str(e))
 
     # end of loop over users
     log.debug("push to BQ")
@@ -745,6 +632,7 @@ def fitbit_nutrition_scope():
                 destination_table=_tablename("nutrition_summary"),
                 project_id=project_id,
                 if_exists="append",
+                progress_bar=False,
                 table_schema=[
                     {
                         "name": "id",
@@ -753,10 +641,15 @@ def fitbit_nutrition_scope():
                         "description": "Primary Key",
                     },
                     {
-                        "name": "date",
+                        "name": "pull_date",
                         "type": "DATE",
                         "mode": "REQUIRED",
                         "description": "The date values were extracted",
+                    },
+                    {
+                        "name": "date",
+                        "type": "DATE",
+                        "description": "Date on which information was logged"
                     },
                     {
                         "name": "calories",
@@ -797,7 +690,7 @@ def fitbit_nutrition_scope():
             )
 
         except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+            log.exception("exception occured: %s", str(e))
 
     if len(nutrition_logs_list) > 0:
 
@@ -810,6 +703,7 @@ def fitbit_nutrition_scope():
                 destination_table=_tablename("nutrition_logs"),
                 project_id=project_id,
                 if_exists="append",
+                progress_bar=False,
                 table_schema=[
                     {
                         "name": "id",
@@ -818,7 +712,7 @@ def fitbit_nutrition_scope():
                         "description": "Primary Key",
                     },
                     {
-                        "name": "date",
+                        "name": "pull_date",
                         "type": "DATE",
                         "mode": "REQUIRED",
                         "description": "The date values were extracted",
@@ -925,7 +819,7 @@ def fitbit_nutrition_scope():
             )
 
         except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+            log.exception("exception occured: %s", str(e))
 
     if len(nutrition_goals_list) > 0:
 
@@ -938,6 +832,7 @@ def fitbit_nutrition_scope():
                 destination_table=_tablename("nutrition_goals"),
                 project_id=project_id,
                 if_exists="append",
+                progress_bar=False,
                 table_schema=[
                     {
                         "name": "id",
@@ -946,7 +841,7 @@ def fitbit_nutrition_scope():
                         "description": "Primary Key",
                     },
                     {
-                        "name": "date",
+                        "name": "pull_date",
                         "type": "DATE",
                         "mode": "REQUIRED",
                         "description": "The date values were extracted",
@@ -960,34 +855,36 @@ def fitbit_nutrition_scope():
             )
 
         except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+            log.exception("exception occured: %s", str(e))
 
     stop = timeit.default_timer()
     execution_time = stop - start
-    print("Nutrition Scope Loaded " + str(execution_time))
+    log.info("Nutrition Scope Loaded " + str(execution_time))
 
     fitbit_bp.storage.user = None
-
-    return "Nutrition Scope Loaded"
+    return last_resp
 
 
 #
 # Heart Data
 #
 @bp.route("/fitbit_heart_rate_scope")
+@token_required
 def fitbit_heart_rate_scope():
 
     start = timeit.default_timer()
+    global last_resp
     project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
-    # if caller provided date as query params, use that otherwise use yesterday
-    date_pulled = request.args.get("date", _date_pulled())
     user_list = fitbit_bp.storage.all_users()
-    if request.args.get("user") in user_list:
-        user_list = [request.args.get("user")]
+    try:
+        if request.headers["user"] in user_list:
+            user_list = [request.headers["user"]]
+    except (Exception):
+        pass
 
     pd.set_option("display.max_columns", 500)
 
-    hr_zones_list = []
+    # hr_zones_list = []
     hr_list = []
 
     for user in user_list:
@@ -999,162 +896,174 @@ def fitbit_heart_rate_scope():
         if fitbit_bp.session.token:
             del fitbit_bp.session.token
 
-        try:
+        """
+        # loop over last synced date in bigquery to now or date specified by user
+        last_sync = request.args.get("date", _last_date_in_bq(_tablename("heart_rate_zones"),
+                                     fitbit_bp.token['user_id'], "date", True))
+        date_list = [last_sync + timedelta(days=x) for x in range((datetime.now()-last_sync).days)]
 
-            resp = fitbit.get(
-                "1/user/-/activities/heart/date/" + date_pulled + "/1d.json"
-            )
-
-            log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
-
-            hr_zones = resp.json()["activities-heart"][0]["value"]
-            zone_list = ["Out of Range", "Fat Burn", "Cardio", "Peak"]
-            hr_zones_columns = [
-                "out_of_range_calories_out",
-                "out_of_range_minutes",
-                "out_of_range_min_hr",
-                "out_of_range_max_hr",
-                "fat_burn_calories_out",
-                "fat_burn_minutes",
-                "fat_burn_min_hr",
-                "fat_burn_max_hr",
-                "cardio_calories_out",
-                "cardio_minutes",
-                "cardio_min_hr",
-                "cardio_max_hr",
-                "peak_calories_out",
-                "peak_minutes",
-                "peak_min_hr",
-                "peak_max_hr",
-            ]
-            hr_zones_df = pd.json_normalize(hr_zones)
-
-            user_activity_zone = pd.DataFrame(
-                {
-                    hr_zones["heartRateZones"][0]["name"]
-                    .replace(" ", "_")
-                    .lower()
-                    + "_calories_out": hr_zones["heartRateZones"][0][
-                        "caloriesOut"
-                    ],
-                    hr_zones["heartRateZones"][0]["name"]
-                    .replace(" ", "_")
-                    .lower()
-                    + "_minutes": hr_zones["heartRateZones"][0]["minutes"],
-                    hr_zones["heartRateZones"][0]["name"]
-                    .replace(" ", "_")
-                    .lower()
-                    + "_min_hr": hr_zones["heartRateZones"][0]["min"],
-                    hr_zones["heartRateZones"][0]["name"]
-                    .replace(" ", "_")
-                    .lower()
-                    + "_max_hr": hr_zones["heartRateZones"][0]["max"],
-                    hr_zones["heartRateZones"][1]["name"]
-                    .replace(" ", "_")
-                    .lower()
-                    + "_calories_out": hr_zones["heartRateZones"][1][
-                        "caloriesOut"
-                    ],
-                    hr_zones["heartRateZones"][1]["name"]
-                    .replace(" ", "_")
-                    .lower()
-                    + "_minutes": hr_zones["heartRateZones"][1]["minutes"],
-                    hr_zones["heartRateZones"][1]["name"]
-                    .replace(" ", "_")
-                    .lower()
-                    + "_min_hr": hr_zones["heartRateZones"][1]["min"],
-                    hr_zones["heartRateZones"][1]["name"]
-                    .replace(" ", "_")
-                    .lower()
-                    + "_max_hr": hr_zones["heartRateZones"][1]["max"],
-                    hr_zones["heartRateZones"][2]["name"]
-                    .replace(" ", "_")
-                    .lower()
-                    + "_calories_out": hr_zones["heartRateZones"][2][
-                        "caloriesOut"
-                    ],
-                    hr_zones["heartRateZones"][2]["name"]
-                    .replace(" ", "_")
-                    .lower()
-                    + "_minutes": hr_zones["heartRateZones"][2]["minutes"],
-                    hr_zones["heartRateZones"][2]["name"]
-                    .replace(" ", "_")
-                    .lower()
-                    + "_min_hr": hr_zones["heartRateZones"][2]["min"],
-                    hr_zones["heartRateZones"][2]["name"]
-                    .replace(" ", "_")
-                    .lower()
-                    + "_max_hr": hr_zones["heartRateZones"][2]["max"],
-                    hr_zones["heartRateZones"][3]["name"]
-                    .replace(" ", "_")
-                    .lower()
-                    + "_calories_out": hr_zones["heartRateZones"][3][
-                        "caloriesOut"
-                    ],
-                    hr_zones["heartRateZones"][3]["name"]
-                    .replace(" ", "_")
-                    .lower()
-                    + "_minutes": hr_zones["heartRateZones"][3]["minutes"],
-                    hr_zones["heartRateZones"][3]["name"]
-                    .replace(" ", "_")
-                    .lower()
-                    + "_min_hr": hr_zones["heartRateZones"][3]["min"],
-                    hr_zones["heartRateZones"][3]["name"]
-                    .replace(" ", "_")
-                    .lower()
-                    + "_max_hr": hr_zones["heartRateZones"][3]["max"],
-                },
-                index=[0],
-            )
-
-            user_activity_zone.insert(0, "id", user)
-            user_activity_zone.insert(1, "date", date_pulled)
-            hr_zones_list.append(user_activity_zone)
-
-        except (Exception) as e:
-            log.error("exception occured: %s", str(e))
-
-        try:
-
-            resp = fitbit.get(
-                "/1/user/-/activities/heart/date/" + date_pulled + "/1d.json"
-            )
-
-            log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
-
-            hr_columns = ["time", "value"]
-
-            respj = resp.json()
-            assert (
-                "activities-heart-intraday" in respj
-            ), "no intraday heart rate data returned"
-            heart_rate = respj["activities-heart-intraday"]["dataset"]
-            heart_rate_df = pd.json_normalize(heart_rate)
-            heart_rate_df = _normalize_response(
-                heart_rate_df, hr_columns, user, date_pulled
-            )
-            heart_rate_df["datetime"] = pd.to_datetime(
-                heart_rate_df["date"] + " " + heart_rate_df["time"]
-            )
+        for pull_date in date_list:
             try:
-                heart_rate_df = heart_rate_df.drop(["time"], axis=1)
-            except:
-                pass
 
-            hr_list.append(heart_rate_df)
+                resp = fitbit.get(
+                    "/1/user/-/activities/heart/date/" + pull_date.strftime("%Y-%m-%d") + "/1d/1sec.json"
+                )
+                last_resp = resp.status_code
 
-        except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+                log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
 
+                hr_zones = resp.json()["activities-heart"][0]["value"]
+
+                user_activity_zone = pd.DataFrame(
+                    {
+                        hr_zones["heartRateZones"][0]["name"]
+                        .replace(" ", "_")
+                        .lower()
+                        + "_calories_out": hr_zones["heartRateZones"][0][
+                            "caloriesOut"
+                        ],
+                        hr_zones["heartRateZones"][0]["name"]
+                        .replace(" ", "_")
+                        .lower()
+                        + "_minutes": hr_zones["heartRateZones"][0]["minutes"],
+                        hr_zones["heartRateZones"][0]["name"]
+                        .replace(" ", "_")
+                        .lower()
+                        + "_min_hr": hr_zones["heartRateZones"][0]["min"],
+                        hr_zones["heartRateZones"][0]["name"]
+                        .replace(" ", "_")
+                        .lower()
+                        + "_max_hr": hr_zones["heartRateZones"][0]["max"],
+                        hr_zones["heartRateZones"][1]["name"]
+                        .replace(" ", "_")
+                        .lower()
+                        + "_calories_out": hr_zones["heartRateZones"][1][
+                            "caloriesOut"
+                        ],
+                        hr_zones["heartRateZones"][1]["name"]
+                        .replace(" ", "_")
+                        .lower()
+                        + "_minutes": hr_zones["heartRateZones"][1]["minutes"],
+                        hr_zones["heartRateZones"][1]["name"]
+                        .replace(" ", "_")
+                        .lower()
+                        + "_min_hr": hr_zones["heartRateZones"][1]["min"],
+                        hr_zones["heartRateZones"][1]["name"]
+                        .replace(" ", "_")
+                        .lower()
+                        + "_max_hr": hr_zones["heartRateZones"][1]["max"],
+                        hr_zones["heartRateZones"][2]["name"]
+                        .replace(" ", "_")
+                        .lower()
+                        + "_calories_out": hr_zones["heartRateZones"][2][
+                            "caloriesOut"
+                        ],
+                        hr_zones["heartRateZones"][2]["name"]
+                        .replace(" ", "_")
+                        .lower()
+                        + "_minutes": hr_zones["heartRateZones"][2]["minutes"],
+                        hr_zones["heartRateZones"][2]["name"]
+                        .replace(" ", "_")
+                        .lower()
+                        + "_min_hr": hr_zones["heartRateZones"][2]["min"],
+                        hr_zones["heartRateZones"][2]["name"]
+                        .replace(" ", "_")
+                        .lower()
+                        + "_max_hr": hr_zones["heartRateZones"][2]["max"],
+                        hr_zones["heartRateZones"][3]["name"]
+                        .replace(" ", "_")
+                        .lower()
+                        + "_calories_out": hr_zones["heartRateZones"][3][
+                            "caloriesOut"
+                        ],
+                        hr_zones["heartRateZones"][3]["name"]
+                        .replace(" ", "_")
+                        .lower()
+                        + "_minutes": hr_zones["heartRateZones"][3]["minutes"],
+                        hr_zones["heartRateZones"][3]["name"]
+                        .replace(" ", "_")
+                        .lower()
+                        + "_min_hr": hr_zones["heartRateZones"][3]["min"],
+                        hr_zones["heartRateZones"][3]["name"]
+                        .replace(" ", "_")
+                        .lower()
+                        + "_max_hr": hr_zones["heartRateZones"][3]["max"],
+                    },
+                    index=[0],
+                )
+
+                if user_activity_zone.empty and resp.status_code == 200:
+                    user_activity_zone.append(pd.Series(dtype='float64'), ignore_index=True)
+                user_activity_zone.insert(0, "id", fitbit_bp.token['user_id'])
+                user_activity_zone.insert(1, "pull_date", datetime.now().strftime("%Y-%m-%d"))
+                user_activity_zone.insert(2, "date", pull_date.strftime("%Y-%m-%d"))
+                hr_zones_list.append(user_activity_zone)
+
+            except (Exception) as e:
+                log.exception("exception occured: %s", str(e))
+
+            if resp.status_code == 429:
+                break
+        """
+
+        # loop over last synced date in bigquery to now or date specified by user
+        last_sync = request.args.get("date", _last_date_in_bq(_tablename("heart_rate"),
+                                     fitbit_bp.token['user_id'], "datetime"))
+        date_list = [last_sync + timedelta(days=x) for x in range((datetime.now()-last_sync).days)]
+
+        for pull_date in date_list:
+            try:
+
+                resp = fitbit.get(
+                    "/1/user/-/activities/heart/date/" + pull_date.strftime("%Y-%m-%d") + "/1d/1sec.json"
+                )
+                last_resp = resp.status_code
+
+                log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
+
+                hr_columns = ["time", "value", "datetime"]
+
+                respj = resp.json()
+                assert (
+                    "activities-heart-intraday" in respj
+                ), "no intraday heart rate data returned"
+                heart_rate = respj["activities-heart-intraday"]["dataset"]
+                heart_rate_df = pd.json_normalize(heart_rate)
+                if heart_rate_df.empty and resp.status_code == 200:
+                    heart_rate_df = heart_rate_df.append(pd.Series(dtype='float64'), ignore_index=True)
+                    heart_rate_df["datetime"] = pd.to_datetime(
+                        pull_date.strftime("%Y-%m-%d") + " " + datetime.min.time().strftime('%H:%M:%S')
+                    )
+                else:
+                    heart_rate_df["datetime"] = pd.to_datetime(
+                        pull_date.strftime("%Y-%m-%d") + " " + heart_rate_df["time"]
+                    )
+                heart_rate_df = _normalize_response(
+                    heart_rate_df, hr_columns, fitbit_bp.token['user_id']
+                )
+
+                try:
+                    heart_rate_df = heart_rate_df.drop(["time"], axis=1)
+                except (Exception):
+                    pass
+
+                hr_list.append(heart_rate_df)
+
+            except (Exception) as e:
+                log.exception("exception occured: %s", str(e))
+
+            if resp.status_code == 429:
+                break
     # end loop over users
 
-    #### CONCAT DATAFRAMES INTO BULK DF ####
+    # CONCAT DATAFRAMES INTO BULK DF #
 
     load_stop = timeit.default_timer()
     time_to_load = load_stop - start
-    print("Heart Rate Zones " + str(time_to_load))
+    log.info("Heart Rate Zones " + str(time_to_load))
 
-    ######## LOAD DATA INTO BIGQUERY #########
+    # LOAD DATA INTO BIGQUERY #
+    """
     if len(hr_zones_list) > 0:
 
         try:
@@ -1166,6 +1075,7 @@ def fitbit_heart_rate_scope():
                 destination_table=_tablename("heart_rate_zones"),
                 project_id=project_id,
                 if_exists="append",
+                progress_bar=False,
                 table_schema=[
                     {
                         "name": "id",
@@ -1173,9 +1083,14 @@ def fitbit_heart_rate_scope():
                         "description": "Primary Key",
                     },
                     {
-                        "name": "date",
+                        "name": "pull_date",
                         "type": "DATE",
                         "description": "The date values were extracted",
+                    },
+                    {
+                        "name": "date",
+                        "type": "DATE",
+                        "description": "Date on which information was logged",
                     },
                     {
                         "name": "out_of_range_calories_out",
@@ -1261,8 +1176,8 @@ def fitbit_heart_rate_scope():
             )
 
         except (Exception) as e:
-            log.error("exception occured: %s", str(e))
-
+            log.exception("exception occured: %s", str(e))
+    """
     if len(hr_list) > 0:
 
         try:
@@ -1274,6 +1189,7 @@ def fitbit_heart_rate_scope():
                 destination_table=_tablename("heart_rate"),
                 project_id=project_id,
                 if_exists="append",
+                progress_bar=False,
                 table_schema=[
                     {
                         "name": "id",
@@ -1281,7 +1197,7 @@ def fitbit_heart_rate_scope():
                         "description": "Primary Key",
                     },
                     {
-                        "name": "date",
+                        "name": "pull_date",
                         "type": "DATE",
                         "description": "The date values were extracted",
                     },
@@ -1297,39 +1213,39 @@ def fitbit_heart_rate_scope():
                 ],
             )
         except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+            log.exception("exception occured: %s", str(e))
 
     stop = timeit.default_timer()
     execution_time = stop - start
-    print("Heart Rate Scope Loaded " + str(execution_time))
+    log.info("Heart Rate Scope Loaded " + str(execution_time))
 
     fitbit_bp.storage.user = None
-
-    return "Heart Rate Scope Loaded"
+    return last_resp
 
 
 #
 # Activity Data
 #
 @bp.route("/fitbit_activity_scope")
+@token_required
 def fitbit_activity_scope():
 
     start = timeit.default_timer()
+    global last_resp
     project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
 
-    # if caller provided date as query params, use that otherwise use yesterday
-    date_pulled = request.args.get("date", _date_pulled())
     user_list = fitbit_bp.storage.all_users()
-    if request.args.get("user") in user_list:
-        user_list = [request.args.get("user")]
+    try:
+        if request.headers["user"] in user_list:
+            user_list = [request.headers["user"]]
+    except (Exception):
+        pass
 
     pd.set_option("display.max_columns", 500)
 
     activities_list = []
     activity_summary_list = []
-    activity_distance_list = []
     activity_goals_list = []
-    omh_activity_list = []
 
     for user in user_list:
 
@@ -1340,115 +1256,126 @@ def fitbit_activity_scope():
         if fitbit_bp.session.token:
             del fitbit_bp.session.token
 
-        try:
+        # loop over last synced date in bigquery to now or date specified by user
+        last_sync = request.args.get("date", _last_date_in_bq(_tablename("activity_summary"),
+                                     fitbit_bp.token['user_id'], "date", True))
+        date_list = [last_sync + timedelta(days=x) for x in range((datetime.now()-last_sync).days)]
 
-            resp = fitbit.get(
-                "/1/user/-/activities/date/" + date_pulled + ".json"
-            )
-
-            log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
-
-            # subset response for activites, summary, and goals
-            activity_goals = resp.json()["goals"]
-            activities = resp.json()["activities"]
-            activity_summary = resp.json()["summary"]
-
-            activity_goals_df = pd.json_normalize(activity_goals)
-            activity_goals_columns = [
-                "activeMinutes",
-                "caloriesOut",
-                "distance",
-                "floors",
-                "steps",
-            ]
-            activity_goals_df = _normalize_response(
-                activity_goals_df, activity_goals_columns, user, date_pulled
-            )
-
-            # activity_distances = resp.json()["summary"]["distances"]
-            # activity_distances_df = pd.json_normalize(activity_distances)
-            # activity_distances_columns = [
-            #     "activity",
-            #     "total_distance",
-            #     "tracker_distance",
-            #     "logged_activites_distance",
-            #     "very_active_distance",
-            #     "moderetly_active_distance",
-            #     "lightly_active_distance",
-            #     "sedentary_active_distance",
-            # ]
-
-            activities_df = pd.json_normalize(activities)
-            # Define columns
-            activites_columns = [
-                "activityId",
-                "activityParentId",
-                "activityParentName",
-                "calories",
-                "description",
-                "distance",
-                "duration",
-                "hasActiveZoneMinutes",
-                "hasStartTime",
-                "isFavorite",
-                "lastModified",
-                "logId",
-                "name",
-                "startDate",
-                "startTime",
-                "steps",
-            ]
-            activities_df = _normalize_response(
-                activities_df, activites_columns, user, date_pulled
-            )
-            activities_df["start_datetime"] = pd.to_datetime(
-                activities_df["start_date"] + " " + activities_df["start_time"]
-            )
-            activities_df = activities_df.drop(
-                ["start_date", "start_time", "last_modified"], axis=1
-            )
-
-            activity_summary_df = pd.json_normalize(activity_summary)
+        for pull_date in date_list:
             try:
-                activity_summary_df = activity_summary_df.drop(
-                    ["distances", "heartRateZones"], axis=1
+
+                resp = fitbit.get(
+                    "/1/user/-/activities/date/" + pull_date.strftime("%Y-%m-%d") + ".json"
                 )
-            except:
-                pass
+                last_resp = resp.status_code
 
-            activity_summary_columns = [
-                "activeScore",
-                "activityCalories",
-                "caloriesBMR",
-                "caloriesOut",
-                "elevation",
-                "fairlyActiveMinutes",
-                "floors",
-                "lightlyActiveMinutes",
-                "marginalCalories",
-                "restingHeartRate",
-                "sedentaryMinutes",
-                "steps",
-                "veryActiveMinutes",
-            ]
+                log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
 
-            activity_summary_df = _normalize_response(
-                activity_summary_df, activity_summary_columns, user, date_pulled
-            )
+                # subset response for activites, summary, and goals
+                try:
+                    activity_goals = resp.json()["goals"]
+                    activity_goals["date"] = pull_date.strftime("%Y-%m-%d")
+                    activity_goals_df = pd.json_normalize(activity_goals)
+                    activity_goals_columns = [
+                        "date",
+                        "activeMinutes",
+                        "caloriesOut",
+                        "distance",
+                        "floors",
+                        "steps",
+                    ]
+                    activity_goals_df = _normalize_response(
+                        activity_goals_df, activity_goals_columns, fitbit_bp.token['user_id']
+                    )
+                    activity_goals_list.append(activity_goals_df)
+                except Exception:
+                    # No data available
+                    pass
+                try:
+                    activities = resp.json()["activities"]
+                    activities_df = pd.json_normalize(activities)
+                    # Define columns
+                    activites_columns = [
+                        "activityId",
+                        "activityParentId",
+                        "activityParentName",
+                        "calories",
+                        "description",
+                        "distance",
+                        "duration",
+                        "hasActiveZoneMinutes",
+                        "hasStartTime",
+                        "isFavorite",
+                        "lastModified",
+                        "logId",
+                        "name",
+                        "startDate",
+                        "startTime",
+                        "steps",
+                    ]
+                    activities_df = _normalize_response(
+                        activities_df, activites_columns, fitbit_bp.token['user_id']
+                    )
+                    activities_df["start_datetime"] = pd.to_datetime(
+                        activities_df["start_date"] + " " + activities_df["start_time"]
+                    )
+                    activities_df = activities_df.drop(
+                        ["start_date", "start_time", "last_modified"], axis=1
+                    )
+                    activities_list.append(activities_df)
+                except KeyError:
+                    # No data available
+                    pass
+                try:
+                    try:
+                        activity_summary = resp.json()["summary"]
+                    except KeyError:
+                        # No data available, provide dict with one row only (with date) to force creation for tracking
+                        if resp.status_code == 200:
+                            activity_summary = {"date": pull_date.strftime("%Y-%m-%d")}
+                    activity_summary_df = pd.json_normalize(activity_summary)
+                    try:
+                        activity_summary_df = activity_summary_df.drop(
+                            ["distances", "heartRateZones"], axis=1
+                        )
+                    except (Exception):
+                        pass
 
-            # Append dfs to df list
-            activities_list.append(activities_df)
-            activity_summary_list.append(activity_summary_df)
-            activity_goals_list.append(activity_goals_df)
+                    activity_summary_columns = [
+                        "date",
+                        "activeScore",
+                        "activityCalories",
+                        "caloriesBMR",
+                        "caloriesOut",
+                        "elevation",
+                        "fairlyActiveMinutes",
+                        "floors",
+                        "lightlyActiveMinutes",
+                        "marginalCalories",
+                        "restingHeartRate",
+                        "sedentaryMinutes",
+                        "steps",
+                        "veryActiveMinutes",
+                    ]
 
-        except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+                    activity_summary_df = _normalize_response(
+                        activity_summary_df, activity_summary_columns, fitbit_bp.token['user_id'],
+                        pull_date.strftime("%Y-%m-%d"), "date", resp.status_code
+                    )
+                    activity_summary_df = activity_summary_df.assign(date=pull_date.strftime("%Y-%m-%d"))
+                    activity_summary_list.append(activity_summary_df)
+                except Exception as e:
+                    log.exception("exception occured: %s", str(e))
+
+            except (Exception) as e:
+                log.exception("exception occured: %s", str(e))
+
+            if resp.status_code == 429:
+                break
 
     fitbit_stop = timeit.default_timer()
     fitbit_execution_time = fitbit_stop - start
-    print("Activity Scope: " + str(fitbit_execution_time))
-
-    # bulk_omh_activity_df = pd.concat(omh_activity_list, axis=0)
+    log.info("Activity Scope: " + str(fitbit_execution_time))
 
     if len(activities_list) > 0:
 
@@ -1461,6 +1388,7 @@ def fitbit_activity_scope():
                 destination_table=_tablename("activity_logs"),
                 project_id=project_id,
                 if_exists="append",
+                progress_bar=False,
                 table_schema=[
                     {
                         "name": "id",
@@ -1468,7 +1396,7 @@ def fitbit_activity_scope():
                         "description": "Primary Key",
                     },
                     {
-                        "name": "date",
+                        "name": "pull_date",
                         "type": "DATE",
                         "description": "The date values were extracted",
                     },
@@ -1505,7 +1433,8 @@ def fitbit_activity_scope():
                     {
                         "name": "duration",
                         "type": "INTEGER",
-                        "description": "The activeDuration (milliseconds) + any pauses that occurred during the activity recording.",
+                        "description": "The activeDuration (milliseconds) + any pauses that occurred during the \
+                            activity recording.",
                     },
                     {
                         "name": "has_active_zone_minutes",
@@ -1522,7 +1451,6 @@ def fitbit_activity_scope():
                         "type": "BOOLEAN",
                         "description": "True | False",
                     },
-                    # {'name': 'last_modified', 'type': 'TIMESTAMP', 'description':'Timestamp the exercise was last modified.'},
                     {
                         "name": "log_id",
                         "type": "INTEGER",
@@ -1547,7 +1475,7 @@ def fitbit_activity_scope():
             )
 
         except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+            log.exception("exception occured: %s", str(e))
 
     if len(activity_summary_list) > 0:
 
@@ -1560,6 +1488,7 @@ def fitbit_activity_scope():
                 destination_table=_tablename("activity_summary"),
                 project_id=project_id,
                 if_exists="append",
+                progress_bar=False,
                 table_schema=[
                     {
                         "name": "id",
@@ -1568,10 +1497,14 @@ def fitbit_activity_scope():
                         "description": "Primary Key",
                     },
                     {
+                        "name": "pull_date",
+                        "type": "DATE",
+                        "description": "The date values were extracted",
+                    },
+                    {
                         "name": "date",
                         "type": "DATE",
-                        "mode": "REQUIRED",
-                        "description": "The date values were extracted",
+                        "description": "The date information was logged",
                     },
                     {
                         "name": "activity_score",
@@ -1581,7 +1514,8 @@ def fitbit_activity_scope():
                     {
                         "name": "activity_calories",
                         "type": "INTEGER",
-                        "description": "The number of calories burned for the day during periods the user was active above sedentary level. This includes both activity burned calories and BMR.",
+                        "description": "The number of calories burned for the day during periods the user was active \
+                            above sedentary level. This includes both activity burned calories and BMR.",
                     },
                     {
                         "name": "calories_bmr",
@@ -1642,7 +1576,7 @@ def fitbit_activity_scope():
             )
 
         except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+            log.exception("exception occured: %s", str(e))
 
     if len(activity_goals_list) > 0:
 
@@ -1655,6 +1589,7 @@ def fitbit_activity_scope():
                 destination_table=_tablename("activity_goals"),
                 project_id=project_id,
                 if_exists="append",
+                progress_bar=False,
                 table_schema=[
                     {
                         "name": "id",
@@ -1663,10 +1598,15 @@ def fitbit_activity_scope():
                         "description": "Primary Key",
                     },
                     {
-                        "name": "date",
+                        "name": "pull_date",
                         "type": "DATE",
                         "mode": "REQUIRED",
                         "description": "The date values were extracted",
+                    },
+                    {
+                        "name": "date",
+                        "type": "DATE",
+                        "description": "The date information was logged"
                     },
                     {
                         "name": "active_minutes",
@@ -1696,35 +1636,37 @@ def fitbit_activity_scope():
                 ],
             )
         except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+            log.exception("exception occured: %s", str(e))
 
     stop = timeit.default_timer()
     execution_time = stop - start
-    print("Activity Scope Loaded: " + str(execution_time))
+    log.info("Activity Scope Loaded: " + str(execution_time))
 
     fitbit_bp.storage.user = None
-
-    return "Activity Scope Loaded"
+    return last_resp
 
 
 #
 # Intraday Data
 #
 @bp.route("/fitbit_intraday_scope")
+@token_required
 def fitbit_intraday_scope():
 
     start = timeit.default_timer()
+    global last_resp
     project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
-    # if caller provided date as query params, use that otherwise use yesterday
-    date_pulled = request.args.get("date", _date_pulled())
     user_list = fitbit_bp.storage.all_users()
-    if request.args.get("user") in user_list:
-        user_list = [request.args.get("user")]
+    try:
+        if request.headers["user"] in user_list:
+            user_list = [request.headers["user"]]
+    except (Exception):
+        pass
 
     pd.set_option("display.max_columns", 500)
 
     intraday_steps_list = []
-    intraday_calories_list = []
+    # intraday_calories_list = []
     intraday_distance_list = []
     intraday_elevation_list = []
     intraday_floors_list = []
@@ -1738,154 +1680,203 @@ def fitbit_intraday_scope():
         if fitbit_bp.session.token:
             del fitbit_bp.session.token
 
-        try:
+        # loop over last synced date in bigquery to now or date specified by user
+        last_sync = request.args.get("date", _last_date_in_bq(_tablename("intraday_steps"),
+                                     fitbit_bp.token['user_id'], "date_time"))
+        date_list = [last_sync + timedelta(days=x) for x in range((datetime.now()-last_sync).days)]
 
-            resp = fitbit.get(
-                "/1/user/-/activities/steps/date/"
-                + date_pulled
-                + "/1d/1min.json"
-            )
+        for pull_date in date_list:
+            try:
 
-            log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
+                resp = fitbit.get(
+                    "/1/user/-/activities/steps/date/"
+                    + pull_date.strftime("%Y-%m-%d")
+                    + "/1d/1min.json"
+                )
+                last_resp = resp.status_code
 
-            intraday_steps = resp.json()["activities-steps-intraday"]["dataset"]
-            intraday_steps_df = pd.json_normalize(intraday_steps)
-            intraday_steps_columns = ["time", "value"]
-            intraday_steps_df = _normalize_response(
-                intraday_steps_df, intraday_steps_columns, user, date_pulled
-            )
-            intraday_steps_df["date_time"] = pd.to_datetime(
-                date_pulled + " " + intraday_steps_df["time"]
-            )
-            intraday_steps_df = intraday_steps_df.drop(["time"], axis=1)
-            intraday_steps_list.append(intraday_steps_df)
+                log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
 
-        except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+                intraday_steps = resp.json()["activities-steps-intraday"]["dataset"]
+                intraday_steps_df = pd.json_normalize(intraday_steps)
+                intraday_steps_columns = ["time", "value"]
+                intraday_steps_df = _normalize_response(
+                    intraday_steps_df, intraday_steps_columns, fitbit_bp.token['user_id']
+                )
+                intraday_steps_df["date_time"] = pd.to_datetime(
+                    pull_date.strftime("%Y-%m-%d") + " " + intraday_steps_df["time"]
+                )
+                intraday_steps_df = intraday_steps_df.drop(["time"], axis=1)
+                intraday_steps_list.append(intraday_steps_df)
 
-        try:
-            #
-            # CALORIES
-            resp = fitbit.get(
-                "/1/user/-/activities/calories/date/"
-                + date_pulled
-                + "/1d/1min.json"
-            )
+            except (Exception) as e:
+                log.exception("exception occured: %s", str(e))
 
-            log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
+            if resp.status_code == 429:
+                break
 
-            intraday_calories = resp.json()["activities-calories-intraday"][
-                "dataset"
-            ]
-            intraday_calories_df = pd.json_normalize(intraday_calories)
-            intraday_calories_columns = ["level", "mets", "time", "value"]
-            intraday_calories_df = _normalize_response(
-                intraday_calories_df,
-                intraday_calories_columns,
-                user,
-                date_pulled,
-            )
-            intraday_calories_df["date_time"] = pd.to_datetime(
-                date_pulled + " " + intraday_calories_df["time"]
-            )
-            intraday_calories_df = intraday_calories_df.drop(["time"], axis=1)
-            intraday_calories_list.append(intraday_calories_df)
+        """
+        # loop over last synced date in bigquery to now or date specified by user
+        last_sync = request.args.get("date", _last_date_in_bq(_tablename("intraday_calories"),
+                                     fitbit_bp.token['user_id'], "date_time"))
+        date_list = [last_sync + timedelta(days=x) for x in range((datetime.now()-last_sync).days)]
 
-        except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+        for pull_date in date_list:
+            try:
+                #
+                # CALORIES
+                resp = fitbit.get(
+                    "/1/user/-/activities/calories/date/"
+                    + pull_date.strftime("%Y-%m-%d")
+                    + "/1d/1min.json"
+                )
+                last_resp = resp.status_code
 
-        try:
-            # DISTANCE
-            resp = fitbit.get(
-                "/1/user/-/activities/distance/date/"
-                + date_pulled
-                + "/1d/1min.json"
-            )
+                log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
 
-            log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
+                intraday_calories = resp.json()["activities-calories-intraday"][
+                    "dataset"
+                ]
+                intraday_calories_df = pd.json_normalize(intraday_calories)
+                intraday_calories_columns = ["level", "mets", "time", "value"]
+                intraday_calories_df = _normalize_response(
+                    intraday_calories_df,
+                    intraday_calories_columns,
+                    fitbit_bp.token['user_id'],
+                )
+                intraday_calories_df["date_time"] = pd.to_datetime(
+                    pull_date.strftime("%Y-%m-%d") + " " + intraday_calories_df["time"]
+                )
+                intraday_calories_df = intraday_calories_df.drop(["time"], axis=1)
+                intraday_calories_list.append(intraday_calories_df)
 
-            intraday_distance = resp.json()["activities-distance-intraday"][
-                "dataset"
-            ]
-            intraday_distance_df = pd.json_normalize(intraday_distance)
-            intraday_calories_columns = ["time", "value"]
-            intraday_distance_df = _normalize_response(
-                intraday_distance_df,
-                intraday_calories_columns,
-                user,
-                date_pulled,
-            )
-            intraday_distance_df["date_time"] = pd.to_datetime(
-                date_pulled + " " + intraday_distance_df["time"]
-            )
-            intraday_distance_df = intraday_distance_df.drop(["time"], axis=1)
-            intraday_distance_list.append(intraday_distance_df)
+            except (Exception) as e:
+                log.exception("exception occured: %s", str(e))
 
-        except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+            if resp.status_code == 429:
+                break
+        """
 
-        try:
-            # ELEVATION
-            resp = fitbit.get(
-                "/1/user/-/activities/elevation/date/"
-                + date_pulled
-                + "/1d/1min.json"
-            )
+        # loop over last synced date in bigquery to now or date specified by user
+        last_sync = request.args.get("date", _last_date_in_bq(_tablename("intraday_distances"),
+                                     fitbit_bp.token['user_id'], "date_time"))
+        date_list = [last_sync + timedelta(days=x) for x in range((datetime.now()-last_sync).days)]
 
-            log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
+        for pull_date in date_list:
+            try:
+                # DISTANCE
+                resp = fitbit.get(
+                    "/1/user/-/activities/distance/date/"
+                    + pull_date.strftime("%Y-%m-%d")
+                    + "/1d/1min.json"
+                )
+                last_resp = resp.status_code
 
-            intraday_elevation = resp.json()["activities-elevation-intraday"][
-                "dataset"
-            ]
-            intraday_elevation_df = pd.json_normalize(intraday_elevation)
-            intraday_elevation_columns = ["time", "value"]
-            intraday_elevation_df = _normalize_response(
-                intraday_elevation_df,
-                intraday_elevation_columns,
-                user,
-                date_pulled,
-            )
-            intraday_elevation_df["date_time"] = pd.to_datetime(
-                date_pulled + " " + intraday_elevation_df["time"]
-            )
-            intraday_elevation_df = intraday_elevation_df.drop(["time"], axis=1)
-            intraday_elevation_list.append(intraday_elevation_df)
+                log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
 
-        except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+                intraday_distance = resp.json()["activities-distance-intraday"][
+                    "dataset"
+                ]
+                intraday_distance_df = pd.json_normalize(intraday_distance)
+                intraday_calories_columns = ["time", "value"]
+                intraday_distance_df = _normalize_response(
+                    intraday_distance_df,
+                    intraday_calories_columns,
+                    fitbit_bp.token['user_id'],
+                )
+                intraday_distance_df["date_time"] = pd.to_datetime(
+                    pull_date.strftime("%Y-%m-%d") + " " + intraday_distance_df["time"]
+                )
+                intraday_distance_df = intraday_distance_df.drop(["time"], axis=1)
+                intraday_distance_list.append(intraday_distance_df)
 
-        try:
-            # FLOORS
-            resp = fitbit.get(
-                "/1/user/-/activities/floors/date/"
-                + date_pulled
-                + "/1d/1min.json"
-            )
+            except (Exception) as e:
+                log.exception("exception occured: %s", str(e))
 
-            log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
+            if resp.status_code == 429:
+                break
 
-            intraday_floors = resp.json()["activities-floors-intraday"][
-                "dataset"
-            ]
-            intraday_floors_df = pd.json_normalize(intraday_floors)
-            intraday_floors_columns = ["time", "value"]
-            intraday_floors_df = _normalize_response(
-                intraday_floors_df, intraday_floors_columns, user, date_pulled
-            )
-            intraday_floors_df["date_time"] = pd.to_datetime(
-                date_pulled + " " + intraday_floors_df["time"]
-            )
-            intraday_floors_df = intraday_floors_df.drop(["time"], axis=1)
-            intraday_floors_list.append(intraday_floors_df)
+        # loop over last synced date in bigquery to now or date specified by user
+        last_sync = request.args.get("date", _last_date_in_bq(_tablename("intraday_elevation"),
+                                     fitbit_bp.token['user_id'], "date_time"))
+        date_list = [last_sync + timedelta(days=x) for x in range((datetime.now()-last_sync).days)]
 
-        except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+        for pull_date in date_list:
+            try:
+                # ELEVATION
+                resp = fitbit.get(
+                    "/1/user/-/activities/elevation/date/"
+                    + pull_date.strftime("%Y-%m-%d")
+                    + "/1d/1min.json"
+                )
+                last_resp = resp.status_code
+
+                log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
+
+                intraday_elevation = resp.json()["activities-elevation-intraday"][
+                    "dataset"
+                ]
+                intraday_elevation_df = pd.json_normalize(intraday_elevation)
+                intraday_elevation_columns = ["time", "value"]
+                intraday_elevation_df = _normalize_response(
+                    intraday_elevation_df,
+                    intraday_elevation_columns,
+                    fitbit_bp.token['user_id'],
+                )
+                intraday_elevation_df["date_time"] = pd.to_datetime(
+                    pull_date.strftime("%Y-%m-%d") + " " + intraday_elevation_df["time"]
+                )
+                intraday_elevation_df = intraday_elevation_df.drop(["time"], axis=1)
+                intraday_elevation_list.append(intraday_elevation_df)
+
+            except (Exception) as e:
+                log.exception("exception occured: %s", str(e))
+
+            if resp.status_code == 429:
+                break
+
+        # loop over last synced date in bigquery to now or date specified by user
+        last_sync = request.args.get("date", _last_date_in_bq(_tablename("intraday_floors"),
+                                     fitbit_bp.token['user_id'], "date_time"))
+        date_list = [last_sync + timedelta(days=x) for x in range((datetime.now()-last_sync).days)]
+
+        for pull_date in date_list:
+            try:
+                # FLOORS
+                resp = fitbit.get(
+                    "/1/user/-/activities/floors/date/"
+                    + pull_date.strftime("%Y-%m-%d")
+                    + "/1d/1min.json"
+                )
+                last_resp = resp.status_code
+
+                log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
+
+                intraday_floors = resp.json()["activities-floors-intraday"][
+                    "dataset"
+                ]
+                intraday_floors_df = pd.json_normalize(intraday_floors)
+                intraday_floors_columns = ["time", "value"]
+                intraday_floors_df = _normalize_response(
+                    intraday_floors_df, intraday_floors_columns, fitbit_bp.token['user_id']
+                )
+                intraday_floors_df["date_time"] = pd.to_datetime(
+                    pull_date.strftime("%Y-%m-%d") + " " + intraday_floors_df["time"]
+                )
+                intraday_floors_df = intraday_floors_df.drop(["time"], axis=1)
+                intraday_floors_list.append(intraday_floors_df)
+
+            except (Exception) as e:
+                log.exception("exception occured: %s", str(e))
+
+            if resp.status_code == 429:
+                break
 
     # end loop over users
 
     fitbit_stop = timeit.default_timer()
     fitbit_execution_time = fitbit_stop - start
-    print("Intraday Scope: " + str(fitbit_execution_time))
+    log.info("Intraday Scope: " + str(fitbit_execution_time))
 
     if len(intraday_steps_list) > 0:
 
@@ -1898,6 +1889,7 @@ def fitbit_intraday_scope():
                 destination_table=_tablename("intraday_steps"),
                 project_id=project_id,
                 if_exists="append",
+                progress_bar=False,
                 table_schema=[
                     {
                         "name": "id",
@@ -1906,7 +1898,7 @@ def fitbit_intraday_scope():
                         "description": "Primary Key",
                     },
                     {
-                        "name": "date",
+                        "name": "pull_date",
                         "type": "DATE",
                         "mode": "REQUIRED",
                         "description": "The date values were extracted",
@@ -1924,8 +1916,9 @@ def fitbit_intraday_scope():
                 ],
             )
         except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+            log.exception("exception occured: %s", str(e))
 
+    """
     if len(intraday_calories_list) > 0:
 
         try:
@@ -1939,6 +1932,7 @@ def fitbit_intraday_scope():
                 destination_table=_tablename("intraday_calories"),
                 project_id=project_id,
                 if_exists="append",
+                progress_bar=False,
                 table_schema=[
                     {
                         "name": "id",
@@ -1947,7 +1941,7 @@ def fitbit_intraday_scope():
                         "description": "Primary Key",
                     },
                     {
-                        "name": "date",
+                        "name": "pull_date",
                         "type": "DATE",
                         "mode": "REQUIRED",
                         "description": "The date values were extracted",
@@ -1971,7 +1965,8 @@ def fitbit_intraday_scope():
                 ],
             )
         except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+            log.exception("exception occured: %s", str(e))
+    """
 
     if len(intraday_distance_list) > 0:
 
@@ -1986,6 +1981,7 @@ def fitbit_intraday_scope():
                 destination_table=_tablename("intraday_distances"),
                 project_id=project_id,
                 if_exists="append",
+                progress_bar=False,
                 table_schema=[
                     {
                         "name": "id",
@@ -1994,7 +1990,7 @@ def fitbit_intraday_scope():
                         "description": "Primary Key",
                     },
                     {
-                        "name": "date",
+                        "name": "pull_date",
                         "type": "DATE",
                         "mode": "REQUIRED",
                         "description": "The date values were extracted",
@@ -2012,7 +2008,7 @@ def fitbit_intraday_scope():
                 ],
             )
         except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+            log.exception("exception occured: %s", str(e))
 
     if len(intraday_elevation_list) > 0:
 
@@ -2027,6 +2023,7 @@ def fitbit_intraday_scope():
                 destination_table=_tablename("intraday_elevation"),
                 project_id=project_id,
                 if_exists="append",
+                progress_bar=False,
                 table_schema=[
                     {
                         "name": "id",
@@ -2035,7 +2032,7 @@ def fitbit_intraday_scope():
                         "description": "Primary Key",
                     },
                     {
-                        "name": "date",
+                        "name": "pull_date",
                         "type": "DATE",
                         "mode": "REQUIRED",
                         "description": "The date values were extracted",
@@ -2053,7 +2050,7 @@ def fitbit_intraday_scope():
                 ],
             )
         except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+            log.exception("exception occured: %s", str(e))
 
     if len(intraday_floors_list) > 0:
 
@@ -2066,6 +2063,7 @@ def fitbit_intraday_scope():
                 destination_table=_tablename("intraday_floors"),
                 project_id=project_id,
                 if_exists="append",
+                progress_bar=False,
                 table_schema=[
                     {
                         "name": "id",
@@ -2074,7 +2072,7 @@ def fitbit_intraday_scope():
                         "description": "Primary Key",
                     },
                     {
-                        "name": "date",
+                        "name": "pull_date",
                         "type": "DATE",
                         "mode": "REQUIRED",
                         "description": "The date values were extracted",
@@ -2092,36 +2090,39 @@ def fitbit_intraday_scope():
                 ],
             )
         except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+            log.exception("exception occured: %s", str(e))
 
     stop = timeit.default_timer()
     execution_time = stop - start
-    print("Intraday Scope Loaded: " + str(execution_time))
+    log.info("Intraday Scope Loaded: " + str(execution_time))
 
     fitbit_bp.storage.user = None
-
-    return "Intraday Scope Loaded"
+    return last_resp
 
 
 #
 # Sleep Data
 #
 @bp.route("/fitbit_sleep_scope")
+@token_required
 def fitbit_sleep_scope():
+    # TODO: Sleep endpoint v1 is deprecated, migrate to 1.2
+    # https://dev.fitbit.com/build/reference/web-api/sleep-v1/
     start = timeit.default_timer()
+    global last_resp
     project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
-    # if caller provided date as query params, use that otherwise use yesterday
-    date_pulled = request.args.get("date", _date_pulled())
     user_list = fitbit_bp.storage.all_users()
-    if request.args.get("user") in user_list:
-        user_list = [request.args.get("user")]
+    try:
+        if request.headers["user"] in user_list:
+            user_list = [request.headers["user"]]
+    except (Exception):
+        pass
 
     pd.set_option("display.max_columns", 500)
 
     sleep_list = []
     sleep_summary_list = []
-    sleep_minutes_list = []
-    # omh_sleep_list = []
+    # sleep_minutes_list = []
 
     for user in user_list:
 
@@ -2132,97 +2133,111 @@ def fitbit_sleep_scope():
         if fitbit_bp.session.token:
             del fitbit_bp.session.token
 
-        try:
+        # loop over last synced date in bigquery to now or date specified by user
+        last_sync = request.args.get("date", _last_date_in_bq(_tablename("sleep_summary"),
+                                     fitbit_bp.token['user_id'], "date", True))
+        date_list = [last_sync + timedelta(days=x) for x in range((datetime.now()-last_sync).days)]
 
-            resp = fitbit.get("/1/user/-/sleep/date/" + date_pulled + ".json")
-
-            log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
-
-            sleep = resp.json()["sleep"]
-
-            # if "minuteData" in resp.json().keys():
-            #     sleep_minutes = resp.json()["sleep"][0]["minuteData"]
-            #     sleep_minutes_df = pd.json_normalize(sleep_minutes)
-            #     sleep_minutes_columns = ["dateTime", "value"]
-            #     sleep_minutes_df = _normalize_response(
-            #         sleep_minutes_df, sleep_minutes_columns, user, date_pulled
-            #     )
-            # else:
-            #     cols = ["dateTime", "value"]
-            #     sleep_minutes_df = pd.DataFrame(columns=cols)
-            #     sleep_minutes_df = _normalize_response(
-            #         sleep_minutes_df, cols, user, date_pulled
-            #     )
-            # sleep_minutes_df["date_time"] = pd.to_datetime(
-            #     date_pulled + " " + sleep_minutes_df["date_time"]
-            # )
-            # sleep_minutes_list.append(sleep_minutes_df)
-
-            sleep_summary = resp.json()["summary"]
-            sleep_df = pd.json_normalize(sleep)
-            sleep_summary_df = pd.json_normalize(sleep_summary)
-
+        for pull_date in date_list:
             try:
-                sleep_df = sleep_df.drop(["minuteData"], axis=1)
-            except:
-                pass
 
-            sleep_columns = [
-                "awakeCount",
-                "awakeDuration",
-                "awakeningsCount",
-                "dateOfSleep",
-                "duration",
-                "efficiency",
-                "endTime",
-                "isMainSleep",
-                "logId",
-                "minutesAfterWakeup",
-                "minutesAsleep",
-                "minutesAwake",
-                "minutesToFallAsleep",
-                "restlessCount",
-                "restlessDuration",
-                "startTime",
-                "timeInBed",
-            ]
-            sleep_summary_columns = [
-                "totalMinutesAsleep",
-                "totalSleepRecords",
-                "totalTimeInBed",
-                "stages.deep",
-                "stages.light",
-                "stages.rem",
-                "stages.wake",
-            ]
+                resp = fitbit.get("/1/user/-/sleep/date/" + pull_date.strftime("%Y-%m-%d") + ".json")
+                last_resp = resp.status_code
 
-            # Fill missing columns
-            sleep_df = _normalize_response(
-                sleep_df, sleep_columns, user, date_pulled
-            )
-            sleep_df["end_time"] = pd.to_datetime(
-                date_pulled + " " + sleep_df["end_time"]
-            )
-            sleep_df["start_time"] = pd.to_datetime(
-                date_pulled + " " + sleep_df["start_time"]
-            )
+                log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
 
-            sleep_summary_df = _normalize_response(
-                sleep_summary_df, sleep_summary_columns, user, date_pulled
-            )
+                sleep = resp.json()["sleep"]
 
-            # Append dfs to df list
-            sleep_list.append(sleep_df)
-            sleep_summary_list.append(sleep_summary_df)
+                """
+                if "minuteData" in resp.json().keys():
+                    sleep_minutes = resp.json()["sleep"][0]["minuteData"]
+                    sleep_minutes_df = pd.json_normalize(sleep_minutes)
+                    sleep_minutes_columns = ["dateTime", "value"]
+                    sleep_minutes_df = _normalize_response(
+                        sleep_minutes_df, sleep_minutes_columns, fitbit_bp.token['user_id']
+                    )
+                else:
+                    cols = ["dateTime", "value"]
+                    sleep_minutes_df = pd.DataFrame(columns=cols)
+                    sleep_minutes_df = _normalize_response(
+                        sleep_minutes_df, cols, fitbit_bp.token['user_id']
+                    )
+                sleep_minutes_df["date_time"] = pd.to_datetime(
+                    pull_date.strftime("%Y-%m-%d") + " " + sleep_minutes_df["date_time"]
+                )
+                sleep_minutes_list.append(sleep_minutes_df)
+                """
 
-        except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+                sleep_summary = resp.json()["summary"]
+                sleep_summary["date"] = pull_date.strftime("%Y-%m-%d")
+                sleep_df = pd.json_normalize(sleep)
+                sleep_summary_df = pd.json_normalize(sleep_summary)
+
+                try:
+                    sleep_df = sleep_df.drop(["minuteData"], axis=1)
+                except (Exception):
+                    pass
+
+                sleep_columns = [
+                    "awakeCount",
+                    "awakeDuration",
+                    "awakeningsCount",
+                    "dateOfSleep",
+                    "duration",
+                    "efficiency",
+                    "endTime",
+                    "isMainSleep",
+                    "logId",
+                    "minutesAfterWakeup",
+                    "minutesAsleep",
+                    "minutesAwake",
+                    "minutesToFallAsleep",
+                    "restlessCount",
+                    "restlessDuration",
+                    "startTime",
+                    "timeInBed",
+                ]
+                sleep_summary_columns = [
+                    "date",
+                    "totalMinutesAsleep",
+                    "totalSleepRecords",
+                    "totalTimeInBed",
+                    "stages.deep",
+                    "stages.light",
+                    "stages.rem",
+                    "stages.wake",
+                ]
+
+                # Fill missing columns
+                sleep_df = _normalize_response(
+                    sleep_df, sleep_columns, fitbit_bp.token['user_id']
+                )
+                sleep_df["end_time"] = pd.to_datetime(
+                    pull_date.strftime("%Y-%m-%d") + " " + sleep_df["end_time"]
+                )
+                sleep_df["start_time"] = pd.to_datetime(
+                    pull_date.strftime("%Y-%m-%d") + " " + sleep_df["start_time"]
+                )
+
+                sleep_summary_df = _normalize_response(
+                    sleep_summary_df, sleep_summary_columns, fitbit_bp.token['user_id']
+                )
+
+                # Append dfs to df list
+                sleep_list.append(sleep_df)
+                sleep_summary_list.append(sleep_summary_df)
+
+            except (Exception) as e:
+                log.exception("exception occured: %s", str(e))
+
+            if resp.status_code == 429:
+                break
 
     # end loop over users
 
     fitbit_stop = timeit.default_timer()
     fitbit_execution_time = fitbit_stop - start
-    print("Sleep Scope: " + str(fitbit_execution_time))
+    log.info("Sleep Scope: " + str(fitbit_execution_time))
 
     if len(sleep_list) > 0:
 
@@ -2235,6 +2250,7 @@ def fitbit_sleep_scope():
                 destination_table=_tablename("sleep"),
                 project_id=project_id,
                 if_exists="append",
+                progress_bar=False,
                 table_schema=[
                     {
                         "name": "id",
@@ -2243,7 +2259,7 @@ def fitbit_sleep_scope():
                         "description": "Primary Key",
                     },
                     {
-                        "name": "date",
+                        "name": "pull_date",
                         "type": "DATE",
                         "mode": "REQUIRED",
                         "description": "The date values were extracted",
@@ -2276,7 +2292,8 @@ def fitbit_sleep_scope():
                     {
                         "name": "efficiency",
                         "type": "INTEGER",
-                        "description": "Calculated sleep efficiency score. This is not the sleep score available in the mobile application.",
+                        "description": "Calculated sleep efficiency score. This is not the sleep score available in \
+                            the mobile application.",
                     },
                     {
                         "name": "end_time",
@@ -2311,7 +2328,8 @@ def fitbit_sleep_scope():
                     {
                         "name": "minutes_to_fall_asleep",
                         "type": "INTEGER",
-                        "decription": "The total number of minutes before the user falls asleep. This value is generally 0 for autosleep created sleep logs.",
+                        "decription": "The total number of minutes before the user falls asleep. This value is \
+                            generally 0 for autosleep created sleep logs.",
                     },
                     {
                         "name": "restless_count",
@@ -2337,8 +2355,9 @@ def fitbit_sleep_scope():
             )
 
         except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+            log.exception("exception occured: %s", str(e))
 
+    """
     if len(sleep_minutes_list) > 0:
 
         try:
@@ -2353,6 +2372,7 @@ def fitbit_sleep_scope():
                 destination_table=_tablename("sleep_minutes"),
                 project_id=project_id,
                 if_exists="append",
+                progress_bar=False,
                 table_schema=[
                     {
                         "name": "id",
@@ -2361,7 +2381,7 @@ def fitbit_sleep_scope():
                         "description": "Primary Key",
                     },
                     {
-                        "name": "date",
+                        "name": "pull_date",
                         "type": "DATE",
                         "mode": "REQUIRED",
                         "description": "The date values were extracted",
@@ -2372,7 +2392,8 @@ def fitbit_sleep_scope():
             )
 
         except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+            log.exception("exception occured: %s", str(e))
+    """
 
     if len(sleep_summary_list) > 0:
 
@@ -2385,6 +2406,7 @@ def fitbit_sleep_scope():
                 destination_table=_tablename("sleep_summary"),
                 project_id=project_id,
                 if_exists="append",
+                progress_bar=False,
                 table_schema=[
                     {
                         "name": "id",
@@ -2393,15 +2415,21 @@ def fitbit_sleep_scope():
                         "description": "Primary Key",
                     },
                     {
-                        "name": "date",
+                        "name": "pull_date",
                         "type": "DATE",
                         "mode": "REQUIRED",
                         "description": "The date values were extracted",
                     },
                     {
+                        "name": "date",
+                        "type": "DATE",
+                        "description": "The date information was logged"
+                    },
+                    {
                         "name": "total_minutes_asleep",
                         "type": "INTEGER",
-                        "description": "Total number of minutes the user was asleep across all sleep records in the sleep log.",
+                        "description": "Total number of minutes the user was asleep across all sleep records in the \
+                            sleep log.",
                     },
                     {
                         "name": "total_sleep_records",
@@ -2411,7 +2439,8 @@ def fitbit_sleep_scope():
                     {
                         "name": "total_time_in_bed",
                         "type": "INTEGER",
-                        "description": "Total number of minutes the user was in bed across all records in the sleep log.",
+                        "description": "Total number of minutes the user was in bed across all records in the sleep \
+                            log.",
                     },
                     {
                         "name": "stages_deep",
@@ -2436,344 +2465,11 @@ def fitbit_sleep_scope():
                 ],
             )
         except (Exception) as e:
-            log.error("exception occured: %s", str(e))
+            log.exception("exception occured: %s", str(e))
 
     stop = timeit.default_timer()
     execution_time = stop - start
-    print("Sleep Scope Loaded: " + str(execution_time))
+    log.info("Sleep Scope Loaded: " + str(execution_time))
 
     fitbit_bp.storage.user = None
-
-    return "Sleep Scope Loaded"
-
-
-#
-# SPO2
-#
-@bp.route("/fitbit_spo2_scope")
-def fitbit_spo2_scope():
-    start = timeit.default_timer()
-    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
-    # if caller provided date as query params, use that otherwise use yesterday
-    date_pulled = request.args.get("date", _date_pulled())
-    user_list = fitbit_bp.storage.all_users()
-    if request.args.get("user") in user_list:
-        user_list = [request.args.get("user")]
-
-    pd.set_option("display.max_columns", 500)
-
-    spo2_list = []
-
-    for user in user_list:
-
-        log.debug("user: %s", user)
-
-        fitbit_bp.storage.user = user
-
-        if fitbit_bp.session.token:
-            del fitbit_bp.session.token
-
-        try:
-
-            resp = fitbit.get(f"/1/user/-/spo2/date/{date_pulled}.json")
-
-            log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
-
-            spo2 = resp.json()["value"]
-            spo2_df = pd.json_normalize(spo2)
-
-            spo2_columns = [
-                "avg",
-                "min",
-                "max",
-            ]
-
-            # Fill missing columns
-            spo2_df = _normalize_response(
-                spo2_df, spo2_columns, user, date_pulled
-            )
-
-            # Append dfs to df list
-            spo2_list.append(spo2_df)
-
-        except (Exception) as e:
-            log.error("spo2 exception occured: %s", str(e))
-
-    # end loop over users
-
-    fitbit_stop = timeit.default_timer()
-    fitbit_execution_time = fitbit_stop - start
-    print("spo2 Scope: " + str(fitbit_execution_time))
-
-    if len(spo2_list) > 0:
-
-        try:
-
-            bulk_spo2_df = pd.concat(spo2_list, axis=0)
-
-            pandas_gbq.to_gbq(
-                dataframe=bulk_spo2_df,
-                destination_table=_tablename("spo2"),
-                project_id=project_id,
-                if_exists="append",
-                table_schema=[
-                    {
-                        "name": "id",
-                        "type": "STRING",
-                        "mode": "REQUIRED",
-                        "description": "Primary Key",
-                    },
-                    {
-                        "name": "date",
-                        "type": "DATE",
-                        "mode": "REQUIRED",
-                        "description": "The date values were extracted",
-                    },
-                    {
-                        "name": "avg",
-                        "type": "FLOAT",
-                        "description": "The mean of the 1 minute SpO2 levels calculated as a percentage value.",
-                    },
-                    {
-                        "name": "min",
-                        "type": "FLOAT",
-                        "description": "The minimum daily SpO2 level calculated as a percentage value.",
-                    },
-                    {
-                        "name": "max",
-                        "type": "FLOAT",
-                        "description": "The maximum daily SpO2 level calculated as a percentage value.",
-                    },
-                ],
-            )
-
-        except (Exception) as e:
-            log.error("spo2 exception occured: %s", str(e))
-
-    
-    stop = timeit.default_timer()
-    execution_time = stop - start
-    print("spo2 Scope Loaded: " + str(execution_time))
-
-    fitbit_bp.storage.user = None
-
-    return "sp02 Scope Loaded"
-
-#
-# SPO2 intraday
-#
-@bp.route("/fitbit_spo2_intraday_scope")
-def fitbit_spo2_intraday_scope():
-    start = timeit.default_timer()
-    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
-    # if caller provided date as query params, use that otherwise use yesterday
-    date_pulled = request.args.get("date", _date_pulled())
-    user_list = fitbit_bp.storage.all_users()
-    if request.args.get("user") in user_list:
-        user_list = [request.args.get("user")]
-
-    pd.set_option("display.max_columns", 500)
-
-    spo2_list = []
-
-    for user in user_list:
-
-        log.debug("user: %s", user)
-
-        fitbit_bp.storage.user = user
-
-        if fitbit_bp.session.token:
-            del fitbit_bp.session.token
-
-        try:
-
-            resp = fitbit.get(f"/1/user/-/spo2/date/{date_pulled}/all.json")
-
-            log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
-
-            spo2 = resp.json()["minutes"]
-            spo2_df = pd.json_normalize(spo2)
-
-            spo2_columns = [
-                "value",
-                "minute"
-            ]
-
-            # Fill missing columns
-            spo2_df = _normalize_response(
-                spo2_df, spo2_columns, user, date_pulled
-            )
-
-            # Append dfs to df list
-            spo2_list.append(spo2_df)
-
-        except (Exception) as e:
-            log.error("spo2 exception occured: %s", str(e))
-
-    # end loop over users
-
-    fitbit_stop = timeit.default_timer()
-    fitbit_execution_time = fitbit_stop - start
-    print("spo2 Scope: " + str(fitbit_execution_time))
-
-    if len(spo2_list) > 0:
-
-        try:
-
-            bulk_spo2_df = pd.concat(spo2_list, axis=0)
-
-            pandas_gbq.to_gbq(
-                dataframe=bulk_spo2_df,
-                destination_table=_tablename("spo2_intraday"),
-                project_id=project_id,
-                if_exists="append",
-                table_schema=[
-                    {
-                        "name": "id",
-                        "type": "STRING",
-                        "mode": "REQUIRED",
-                        "description": "Primary Key",
-                    },
-                    {
-                        "name": "date",
-                        "type": "DATE",
-                        "mode": "REQUIRED",
-                        "description": "The date values were extracted",
-                    },
-                    {
-                        "name": "value",
-                        "type": "FLOAT",
-                        "description": "The percentage value of SpO2 calculated at a specific date and time in a single day.",
-                    },
-                    {
-                        "name": "minute",
-                        "type": "DATETIME",
-                        "description": "The date and time at which the SpO2 measurement was taken.",
-                    }
-                ],
-            )
-
-        except (Exception) as e:
-            log.error("spo2 exception occured: %s", str(e))
-
-    
-    stop = timeit.default_timer()
-    execution_time = stop - start
-    print("spo2 Scope Loaded: " + str(execution_time))
-
-    fitbit_bp.storage.user = None
-
-    return "sp02 Scope Loaded"
-
-
-#
-# skin temp
-#
-@bp.route("/fitbit_temp_scope")
-def fitbit_temp_scope():
-    start = timeit.default_timer()
-    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
-    # if caller provided date as query params, use that otherwise use yesterday
-    date_pulled = request.args.get("date", _date_pulled())
-    user_list = fitbit_bp.storage.all_users()
-    if request.args.get("user") in user_list:
-        user_list = [request.args.get("user")]
-
-    pd.set_option("display.max_columns", 500)
-
-    temp_list = []
-
-    for user in user_list:
-
-        log.debug("user: %s", user)
-
-        fitbit_bp.storage.user = user
-
-        if fitbit_bp.session.token:
-            del fitbit_bp.session.token
-
-        try:
-            resp = fitbit.get(f"/1/user/-/temp/skin/date/{date_pulled}.json")
-
-            log.debug("%s: %d [%s]", resp.url, resp.status_code, resp.reason)
-
-            temp = resp.json()["tempSkin"]
-            temp_df = pd.json_normalize(temp)
-
-            temp_columns = [
-                "dateTime",
-                "logType",
-                "value.nightlyRelative"
-            ]
-
-            # Fill missing columns
-            temp_df = _normalize_response(
-                temp_df, temp_columns, user, date_pulled
-            )
-
-            # Append dfs to df list
-            temp_list.append(temp_df)
-
-        except (Exception) as e:
-            log.error("temp exception occured: %s", str(e))
-
-    # end loop over users
-
-    fitbit_stop = timeit.default_timer()
-    fitbit_execution_time = fitbit_stop - start
-    print("temp Scope: " + str(fitbit_execution_time))
-
-    if len(temp_list) > 0:
-
-        try:
-
-            bulk_temp_df = pd.concat(temp_list, axis=0)
-
-            pandas_gbq.to_gbq(
-                dataframe=bulk_temp_df,
-                destination_table=_tablename("skintemp"),
-                project_id=project_id,
-                if_exists="append",
-                table_schema=[
-                    {
-                        "name": "id",
-                        "type": "STRING",
-                        "mode": "REQUIRED",
-                        "description": "Primary Key",
-                    },
-                    {
-                        "name": "date",
-                        "type": "DATE",
-                        "mode": "REQUIRED",
-                        "description": "The date values were extracted",
-                    },
-                    {
-                        "name": "dateTime",
-                        "type": "DATE",
-                        "mode": "REQUIRED",
-                        "description": "the date of the measurements",
-                    },
-                    {
-                        "name": "logType",
-                        "type": "FLOAT",
-                        "description": "The type of skin temperature log created",
-                    },
-                    {
-                        "name": "value.nightlyRelative",
-                        "type": "FLOAT",
-                        "description": "The user's average temperature during a period of sleep.",
-                    },
-                ],
-            )
-
-        except (Exception) as e:
-            log.error("temp exception occured: %s", str(e))
-
-    
-    stop = timeit.default_timer()
-    execution_time = stop - start
-    print("temp Scope Loaded: " + str(execution_time))
-
-    fitbit_bp.storage.user = None
-
-    return "temp Scope Loaded"
+    return last_resp

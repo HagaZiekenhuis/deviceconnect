@@ -114,7 +114,8 @@ def auth():
         #
         # have to hit the logout anyway to revoke any tokens
         #
-        return f"User not registered for this study.  <a href='{url_for('frontend_bp.logout', _external=True)}'>click here</a>"
+        return f"User not registered for this study.  <a href='{url_for('frontend_bp.logout', _external=True)}'" \
+            ">click here</a>"
 
     log.info("user logged in: %s", str(token["userinfo"]))
 

@@ -1,0 +1,17 @@
+version: '3'
+services:
+  fitbit-onboarding:
+    build: .
+    env_file:
+      - .env-docker
+    ports:
+      - "5000:5000"
+  reverse-proxy:
+    image: 'jc21/nginx-proxy-manager:latest'
+    ports:
+      - '80:80'
+      - '81:81'
+      - '443:443'
+    volumes:
+      - ./data:/data
+      - ./letsencrypt:/etc/letsencrypt

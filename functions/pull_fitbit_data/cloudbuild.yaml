@@ -1,0 +1,11 @@
+steps:
+- name: 'gcr.io/cloud-builders/gcloud'
+  args: 
+    - functions
+    - deploy 
+    - 'pull-fitbit-data'
+    - '--trigger-http'
+    - '--runtime=python310'
+    - '--entry-point=device_async'
+    - '--region=europe-west1'
+  dir: 'functions/pull_fitbit_data'

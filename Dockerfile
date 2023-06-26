@@ -17,11 +17,12 @@ FROM python:3.10-slim
 ENV PYTHONUNBUFFERED True
 ENV APP_HOME /app
 WORKDIR $APP_HOME
-COPY . ./
 
 # Install production dependencies.
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+COPY . ./
 ENV FLASK_ENV=PRODUCTION
 
-CMD exec gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 0 app.main:app
+CMD if [ -n "$FILE_GOOGLE_APPLICATION_CREDENTIALS" ]; then echo $FILE_GOOGLE_APPLICATION_CREDENTIALS | base64 -i -d > /tmp/creds.json; export GOOGLE_APPLICATION_CREDENTIALS=/tmp/creds.json; fi && exec gunicorn --bind :5000 --workers 3 --threads 1 --timeout 0 app.main:app

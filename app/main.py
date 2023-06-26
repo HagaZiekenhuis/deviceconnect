@@ -30,7 +30,6 @@ Configuration:
 Routes:
 
     / (index) - if logged in, show user status, if not, redirect to splash
-    /splash - show application splash page and login button
 
     the rest of the routes are provided by other modules.
 """
@@ -39,17 +38,19 @@ import logging
 from flask import Flask, session, redirect, render_template, request, url_for
 from werkzeug.middleware.proxy_fix import ProxyFix
 from flask_dance.contrib.fitbit import fitbit
+from firebase_admin import firestore
 
-from .fitbit_auth import bp as fitbit_auth_bp, fitbit_bp
+from .fitbit_auth import bp as fitbit_auth_bp, fitbit_bp, FITBIT_SCOPES
 from .frontend import bp as frontend_bp
 from .fitbit_ingest import bp as fitbit_ingest_bp
+from .security import generate_control_number
 
 
 #
 # configuration
 #
 app = Flask(__name__)
-app.secret_key = "b9718561170654e9cc5d2594ecd36a1264760b890a415546cd0ef9cc716e4c15"  # pylint: disable=line-too-long
+app.secret_key = os.environ.get("SECRET_KEY")
 
 # fix for running behind a proxy, such as with cloudrun
 app.wsgi_app = ProxyFix(app.wsgi_app)
@@ -70,11 +71,10 @@ if not os.environ.get("BACKEND_ONLY"):
 if os.environ.get("DEBUG"):
     logging.basicConfig(level=logging.DEBUG)
 
+
 #
 # main routes
 #
-
-
 @app.route("/splash")
 def splash():
     return render_template("splash.html")
@@ -96,11 +96,45 @@ def index():
     if fitbit_bp.session.token:
         del fitbit_bp.session.token
 
+    if fitbit.authorized:
+        fitbit_id = fitbit_bp.token['user_id']
+        control_number = generate_control_number(fitbit_id)
+        if sorted(fitbit_bp.token['scope']) != sorted(FITBIT_SCOPES):
+            is_missing_scopes = True
+            missing_scopes = ', '.join(list(set(FITBIT_SCOPES) - set(fitbit_bp.token['scope'])))
+        else:
+            is_missing_scopes = False
+            missing_scopes = ''
+    else:
+        control_number = 0
+        is_missing_scopes = False
+        missing_scopes = ''
+        fitbit_id = ''
+
+    db = firestore.client()
+    docs = db.collection(os.environ.get("FIRESTORE_DATASET", "tokens")).stream()
+    registered_device_ids = []
+    registered_device_docids = []
+    for doc in docs:
+        if str(doc.id).startswith(user["email"]):
+            registered_device_ids.append(doc.to_dict()["user_id"])
+            registered_device_docids.append(doc.id)
+    if registered_device_ids:
+        registered_devices = zip(registered_device_ids, registered_device_docids)
+    else:
+        registered_devices = None
+
     return render_template(
         "home.html",
         user=user,
         app_name=request.host_url,
         is_fitbit_registered=fitbit.authorized,
+        fitbit_id=fitbit_id,
+        control_number=control_number,
+        required_scopes=', '.join(FITBIT_SCOPES),
+        is_missing_scopes=is_missing_scopes,
+        missing_scopes=missing_scopes,
+        registered_devices=registered_devices
     )
 
 

@@ -50,6 +50,7 @@ Configuration:
 import os
 from datetime import date
 import requests
+import json
 import logging
 
 import pandas as pd
@@ -60,20 +61,19 @@ from flask import Blueprint, redirect, url_for, session
 from flask_dance.contrib.fitbit import fitbit, make_fitbit_blueprint
 
 from .firestore_storage import FirestoreStorage
+from firebase_admin import firestore
+
 
 FITBIT_SCOPES = [
     "activity",
     "heartrate",
     "location",
-    "nutrition",
     "profile",
     "settings",
     "sleep",
     "social",
-    "weight",
-    "oxygen_saturation",
-    "temperature"
 ]
+os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = os.environ.get('OAUTHLIB_RELAX_TOKEN_SCOPE', '1')
 
 firestore_datasetname = os.environ.get("FIRESTORE_DATASET")
 if not firestore_datasetname:
@@ -129,39 +129,78 @@ def device_registration():
             )
 
             if resp.status_code == requests.codes.ok:
-                _export_profile_to_bigquery(username, resp.content)
+                _export_profile_to_bigquery(fitbit_bp.token['user_id'], resp.content)
 
         except (Exception) as e:
-            print("error" + e)
+            log.error("error" + e)
 
         return redirect("/")
 
 
-@bp.route("/delete")
-def device_delete():
-    """Unlinks the user's fitbit device from this account.
-
-    deletes oauth tokens from stable storage so no further
-    data will be ingested.
+@bp.route("/next_device")
+def next_device():
+    """Moves Fitbit information to a new document in
+    Firestore to free up the document to allow for new device registrations.
     """
-    if fitbit.authorized:
-        log.debug("deleting user token for %s", fitbit_bp.storage.user)
-        del fitbit_bp.token
-    else:
-        log.debug("no fitbit associated with current user")
 
+    user = session.get("user")
+
+    if user is None:
+        return redirect(url_for("/login"))
+
+    username = session.get("user")["email"]
+
+    db = firestore.client()
+    doc_ref = db.collection(os.environ.get("FIRESTORE_DATASET", "tokens")).document(username)
+    doc = doc_ref.get().to_dict()
+    db.collection(os.environ.get("FIRESTORE_DATASET", "tokens")).document(username + "_" + doc["user_id"]).set(doc)
+    db.collection(os.environ.get("FIRESTORE_DATASET", "tokens")).document(username).delete()
     return redirect("/")
 
 
-def _normalize_response(df, column_list, user_email):
+@bp.route("/<document_id>/deregister_device")
+def deregister_device(document_id=None):
+    """Unlinks the user's fitbit device from this account.
+    Tokens will be revoked. so no further data can be ingested.
+    """
+
+    # Set the to be deleted user
+    if document_id.startswith(session.get("user")["email"]):
+        fitbit_bp.storage.user = document_id
+
+    if fitbit_bp.session.token:
+        del fitbit_bp.session.token
+    try:
+        requests.post(
+            "https://api.fitbit.com/oauth2/revoke",
+            headers={
+                "Authorization": f"Bearer {fitbit_bp.token['access_token']}",
+                "client_id": os.environ.get("FITBIT_OAUTH_CLIENT_ID")
+            },
+            params={
+                "token": fitbit_bp.token['access_token'],
+                "client_id": os.environ.get("FITBIT_OAUTH_CLIENT_ID")
+            }
+        )
+    except (Exception):
+        log.debug("Unable to revoke tokens via Fitbit API")
+    log.debug("deleting user token for %s", fitbit_bp.storage.user)
+    del fitbit_bp.token
+
+    # Revert back to last signed in user
+    username = session.get("user")["email"]
+    fitbit_bp.storage.user = username
+    return redirect("/")
+
+
+def _normalize_response(df, column_list, fitbit_id):
     date_pulled = date.today().strftime("%Y-%m-%d")
     for col in column_list:
         if col not in df.columns:
             df[col] = None
         df = df.reindex(columns=column_list)
-    df.insert(0, "id", user_email)
+    df.insert(0, "id", fitbit_id)
     df.insert(1, "date", date_pulled)
-    df.insert(14, "surgery_date", date_pulled)
     df = clean_columns(df)
 
     return df
@@ -170,17 +209,14 @@ def _normalize_response(df, column_list, user_email):
 def _export_profile_to_bigquery(id, profile):
 
     project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
-
-    profile_df = pd.json_normalize(profile)
+    profile = profile.decode().replace("\\", "")
+    profile_df = pd.json_normalize(json.loads(profile))
     profile_columns = [
         "user.age",
         "user.city",
         "user.state",
         "user.country",
         "user.dateOfBirth",
-        "user.displayName",
-        "user.encodedId",
-        "user.fullName",
         "user.gender",
         "user.height",
         "user.heightUnit",
@@ -208,17 +244,20 @@ def _export_profile_to_bigquery(id, profile):
             {
                 "name": "user_city",
                 "type": "STRING",
-                "description": "The city specified in the user's account settings. Location scope is required to see this value.",
+                "description": "The city specified in the user's account settings. Location scope is required to see \
+                    this value.",
             },
             {
                 "name": "user_state",
                 "type": "STRING",
-                "description": "The state specified in the user's account settings. Location scope is required to see this value. ",
+                "description": "The state specified in the user's account settings. Location scope is required to see \
+                    this value. ",
             },
             {
                 "name": "user_country",
                 "type": "STRING",
-                "description": "The country specified in the user's account settings. Location scope is required to see this value.",
+                "description": "The country specified in the user's account settings. Location scope is required to \
+                    see this value.",
             },
             {
                 "name": "user_date_of_birth",
@@ -226,19 +265,9 @@ def _export_profile_to_bigquery(id, profile):
                 "description": "The birthday date specified in the user's account settings.",
             },
             {
-                "name": "user_display_name",
-                "type": "STRING",
-                "description": "The name shown when the user's friends look at their Fitbit profile, send a message, or other interactions within the Friends section of the Fitbit app or fitbit.com dashboard, such as challenges.",
-            },
-            {
                 "name": "user_encoded_id",
                 "type": "STRING",
                 "description": "The encoded ID of the user. Use '-' (dash) for current logged-in user.",
-            },
-            {
-                "name": "user_full_name",
-                "type": "STRING",
-                "description": "The full name value specified in the user's account settings.",
             },
             {
                 "name": "user_gender",
@@ -259,7 +288,6 @@ def _export_profile_to_bigquery(id, profile):
                 "name": "user_timezone",
                 "type": "STRING",
                 "description": "The timezone defined in the user's account settings.",
-            },
-            {"name": "surgery_date", "type": "DATE"},
+            }
         ],
     )

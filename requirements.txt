@@ -1,5 +1,5 @@
 authlib
-Flask==2.0.1
+Flask==2.0.3
 Flask-Session
 requests==2.26.0
 google-auth==2.0.0
@@ -14,19 +14,17 @@ flask-login
 werkzeug
 
 firebase-admin
-google-api-core==2.10.1
-google-api-python-client==2.63.0
-google-cloud-bigquery==3.4.1
-google-cloud-datastore==2.8.1
-google-cloud-secret-manager==2.12.4
-google-cloud-storage==2.5.0
-google-cloud-firestore==2.7.0
+google-cloud-bigquery
+google-cloud-datastore
+google-cloud-secret-manager
+google-cloud-storage
+google-cloud-firestore
 
 parse
+logger
 skimpy
 datetime
 numpy
 config
 flask-talisman
-
 pyzmq==23.2.0

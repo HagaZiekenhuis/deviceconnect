@@ -1,0 +1,46 @@
+#  Template python-build
+
+#  This template allows you to validate your python code.
+#  The workflow allows running tests and code linting on the default branch.
+
+image: python:3.8
+
+pipelines:
+  default:
+    - parallel:
+      - step:
+          name: Doc generator
+          caches:
+            - pip
+          script:
+            - cd docs
+            - if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+            - apt-get update && apt-get -y install python3-sphinx
+            - pip install sphinx_rtd_theme
+            - make clean
+            - make html
+          artifacts:
+            - docs/_build/html/**
+      - step:
+          name: Lint code
+          script:
+            # Enforce style consistency across Python projects https://flake8.pycqa.org/en/latest/manpage.html
+            - pip install flake8
+            - flake8 . --extend-exclude=dist,build --show-source --statistics --max-line-length=120
+    - parallel:
+      - step:
+          name: Publish docs
+          script:
+            - apt-get update
+            - apt install --no-install-recommends -y git openssh-client
+            - git config --global user.name "Jasper van Dalum"
+            - git config --global user.email "j.vandalum@omnigen.nl"
+            - git clone git@bitbucket.org:omnigen/omnigen.bitbucket.io.git
+            - cd omnigen.bitbucket.io
+            - mkdir mkdir -p me-time-fitbit-onboarding
+            - cp -r ../docs/_build/html/* me-time-fitbit-onboarding/
+            - git add -A
+            - git commit -m "Automatically pushed new version of documentation at $(date) ${BITBUCKET_COMMIT}" || true
+            - git push || true
+            
+          

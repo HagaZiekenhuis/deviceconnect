@@ -17,7 +17,7 @@
  -->
 
 <html>
-<title>Cymbal Health - Device Registration</title>
+<title>Me-TIME studie - Apparaat Registratie</title>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="stylesheet" href="https://www.w3schools.com/w3css/4/w3.css">
@@ -32,19 +32,20 @@
 
 </head>
 
-<body class="w3-light-grey background-image">
+<body class="w3-light-grey" >
+  <img class="background-image"></img>
   <!-- w3-content defines a container for fixed size centered content,
 and is wrapped around the whole page content, except for the footer in this example -->
   <div class="w3-content" style="max-width:1400px">
     <!-- 20220329 -->
     <!-- Header -->
     <header class="w3-container w3-margin">
-      <h1 class="login-text"><b>Cymbal Health - Device Registration</b></h1>
+      <h1 class="header-text"><b>Me-TIME studie - Apparaat Registratie</b></h1>
     </header>
     <div class="login">
       <div class="w3-card-4 w3-margin w3-white card">
         <div class="w3-container">
-          <h3 style="color:#3c3c3c; font-family: 'Avenir Next World Regular'"><b>Login</b></h3>
+          <h3 style="color:#3c3c3c; font-family: 'sans-serif'"><b>Login</b></h3>
         </div>
         <div class="w3-container">
           <form action='login' method='POST'>
@@ -52,23 +53,29 @@ and is wrapped around the whole page content, except for the footer in this exam
             {% if messages %}
             {% for message in messages %}
             <div id="flash">
-              <p style="color:red; font-family: 'Avenir Next World Regular'"> {{ message }} </p>
+              <p style="color:red; font-family: 'sans-serif'"> {{ message }} </p>
             </div>
             {% endfor %}
             {% endif %}
             {% endwith %}
             <div style="display: none" id="tippass">
-              <p style="color:red; font-family: 'Avenir Next World Regular'"> The password you entered was not correct,
-                please make sure you entered the correct email and try again.</p>
+              <p style="color:red; font-family: 'sans-serif'"> Het wachtwoord dat u heeft ingevoerd is niet correct,
+                controleer of u het juiste wachtwoord en email adres heeft gebruikt en probeer het opnieuw.</p>
             </div>
-            <p style="font-family: 'Avenir Next World Regular'"> Email Address:</p>
+            <p style="font-family: 'sans-serif'"> Email Adres:</p>
             <input class="input-box" type="text" id="email" name="email" value="{{email}}"><br>
-            <p style="font-family: 'Avenir Next World Regular'">Password:</p>
+            <p style="font-family: 'sans-serif'">Wachtwoord:</p>
             <input class="input-box" type="password" id="password" name="password"><br>
             <br>
             <div class="col-md-9">
-              <button class="btn btn-primary" type="submit"
-                style="border-color: #1010eb; color:#140f4b; font-family: 'Avenir Next World Regular'"> Submit </button>
+              <button class="btn btn-primary round-button" type="submit"
+                style="font-family: 'sans-serif'"> <b> Submit</b> </button>
+            </div>
+            
+            <div class="haga-footer" data-position="fixed">
+              <div class="haga-footer-image-space">
+                <img id="haga-footer-image" src="../static/img/green_overlay.svg">
+              </div>
             </div>
             <br>
           </form>

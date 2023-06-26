@@ -1,0 +1,5 @@
+requests
+requests-futures
+firebase-admin
+google-cloud-firestore
+functions_framework

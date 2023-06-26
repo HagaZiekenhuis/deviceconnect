@@ -29,48 +29,69 @@
 
 <head>
   <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
-
+  <script>
+    jQuery.get("{{url_for('static', filename='tos.txt') }}", function(data) {
+      $(tos_file).html(data);
+    });
+  </script>
 </head>
 
-<body class="w3-light-grey background-image">
+<body class="w3-light-grey">
   <!-- w3-content defines a container for fixed size centered content,
 and is wrapped around the whole page content, except for the footer in this example -->
   <div class="w3-content" style="max-width:1400px">
     <!-- 20220329 -->
     <!-- Header -->
     <header class="w3-container w3-margin">
-      <h1 class="login-text"><b>Cymbal Health - Terms of Service</b></h1>
+      <h1 class="header-text"><b>ME Time studie - Algemene voorwaardene</b></h1>
     </header>
+    <img class="background-image"></img>
     <div class="w3-card-4 w3-margin w3-white card" id="disclaimer">
       <div class="w3-container">
-        <h3 style="color:#3c3c3c; font-family: 'Avenir Next World Regular'"><u><b>Informed Consent Page</b></u></h3>
+        <h3 style="color:#3c3c3c; font-family: 'sans-serif'"><b>Informed Consent Page</b></h3>
       </div>
       <div class="w3-container">
-        <p style="color:#3c3c3c; font-family: 'Avenir Next World Regular'">Please carefully read prior to acknowledging
-          and accepting the following Informed Consent:</p>
-        <p style="color:#3c3c3c; font-family: 'Avenir Next World Regular'">
-          <embed width="100%" src="{{url_for('static', filename='tos.txt') }}">
-        </p>
+        <p style="color:#3c3c3c; font-family: 'sans-serif'"> <b>Please carefully read prior to acknowledging
+          and accepting the following Informed Consent: </b></p>
+          
+        <div class="embed-container" style="overflow-y: scroll; height: 200px; margin-bottom: 10px;">
+          <span style="white-space: pre-wrap;" id="tos_file"></span>
+        </div>
+
         <div>
           <form action="tos" method="POST">
             <input type="checkbox" id="agree" name="agree">
-            <label style="color:#3c3c3c; font-family: 'Avenir Next World Regular'" for="agree">I Agree</label><br>
-            <label style="color:#3c3c3c; font-family: 'Avenir Next World Regular'">Name</label><br>
-            <input style="color:#3c3c3c; font-family: 'Avenir Next World Regular'" id="name" name="name" size="50" value="{{name}}"><br>
-
-            <label style="color:#3c3c3c; font-family: 'Avenir Next World Regular'">Signature</label><br>
-            <input style="color:#3c3c3c; font-family: 'Avenir Next World Regular'" id="sig" name="sig" size="50" value="{{sig}}"><br>
-
-            <label style="color:#3c3c3c; font-family: 'Avenir Next World Regular'">Date</label><br>
-            <input style="color:#3c3c3c; font-family: 'Avenir Next World Regular'" id="date" name="date" size="50" value="{{date}}"><br>
+            <label style="color:#3c3c3c; font-family: 'sans-serif'" for="agree">Ik snap de algemene voorwaarden en ik ga hiermee akkoord</label><br>
 
             <br>
-            <button style="border-color: #1010eb; color:#140f4b; font-family: 'Avenir Next World Regular'" id="accept"
-              class="btn btn-primary" type="submit"> Accept </button>
+
+            <label style="color:#3c3c3c; font-family: 'sans-serif'">Naam</label><br>
+            <input style="color:#3c3c3c; font-family: 'sans-serif'" id="name" name="name" size="50" value="{{name}}"><br>
+
+            <label style="color:#3c3c3c; font-family: 'sans-serif'">Handtekening</label><br>
+            <input style="color:#3c3c3c; font-family: 'sans-serif'" id="sig" name="sig" size="50" value="{{sig}}"><br>
+
+            <label style="color:#3c3c3c; font-family: 'sans-serif'">Datum</label><br>
+            <input style="color:#3c3c3c; font-family: 'sans-serif'" id="date" name="date" size="50" value="{{date}}"><br>
+
+            <br/>
+            
+            <button class="btn btn-primary round-button" type="submit" style="font-family: 'sans-serif';
+             margin-bottom: 0px; float: initial;"
+            id="accept" type="submit"> <b> Accept </b> </button>
           </form>
+
+          
+          <div class="haga-footer" data-position="fixed">
+            <div class="haga-footer-image-space">
+              <img id="haga-footer-image" src="../static/img/green_overlay.svg">
+          </div>
+          
         </div>
+
         <br>
-        <div class="w3-row">
+        <div class="w3-row"> </div>
+
         </div>
       </div>
     </div>
